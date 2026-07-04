@@ -114,17 +114,6 @@ struct RatioThinkApp: App {
     let center = ModelLoadCenter()
     let prefs = AppPreferences(defaults: Self.appPreferencesDefaults())
     let testBaseURL = Self.chatTestEngineBaseURL()
-    // #504/#616: one construction point for the status store (incl. the DEBUG
-    // PIE_TEST_PIN_ENGINE_RUNNING / PIE_TEST_ENGINE_START_TO_RUNNING harness
-    // seams). `enginePinned` gates the poll loop below; `residentSeed` is the
-    // pinned-running GUI seam's resident-model seed, applied to `center` here
-    // (kept out of the factory so the factory never reaches into ModelLoadCenter).
-    let (statusStore, enginePinned, residentSeed) =
-      Self.makeEngineStatusStore(testBaseURL: testBaseURL, preferences: prefs)
-    if let residentSeed {
-      center.reconcileEngineResident(residentSeed)
-    }
-    let engine = Self.makeEngineClient(testBaseURL: testBaseURL, statusStore: statusStore)
     // Build the persistence-status surface first so the profile store's
     // start() failure has a visible channel (review F3).
     let status = PersistenceStatus()
@@ -141,6 +130,21 @@ struct RatioThinkApp: App {
     } catch {
       status.report(error, context: "RatioThinkApp.ProfileStore.start")
     }
+    // #504/#616: one construction point for the status store (incl. the DEBUG
+    // PIE_TEST_PIN_ENGINE_RUNNING / PIE_TEST_ENGINE_START_TO_RUNNING harness
+    // seams). `enginePinned` gates the poll loop below; `residentSeed` is the
+    // pinned-running GUI seam's resident-model seed, applied to `center` here
+    // (kept out of the factory so the factory never reaches into ModelLoadCenter).
+    let (statusStore, enginePinned, residentSeed) =
+      Self.makeEngineStatusStore(
+        testBaseURL: testBaseURL,
+        preferences: prefs,
+        activeProfileIDProvider: { store.activeProfileID }
+      )
+    if let residentSeed {
+      center.reconcileEngineResident(residentSeed)
+    }
+    let engine = Self.makeEngineClient(testBaseURL: testBaseURL, statusStore: statusStore)
 
     _modelLoadCenter = StateObject(wrappedValue: center)
     _appPreferences = StateObject(wrappedValue: prefs)
@@ -263,7 +267,8 @@ struct RatioThinkApp: App {
   @MainActor
   private static func makeEngineStatusStore(
     testBaseURL: URL?,
-    preferences prefs: AppPreferences
+    preferences prefs: AppPreferences,
+    activeProfileIDProvider: @escaping @MainActor @Sendable () -> String?
   ) -> (store: EngineStatusStore, enginePinned: Bool, residentSeed: String?) {
     #if DEBUG
     let pinnedRunningPort: EnginePort? = {
@@ -293,7 +298,8 @@ struct RatioThinkApp: App {
                                                       servedModelID: servedModelID,
                                                       daemonBindHost: prefs.localAPIBindMode)),
         initialDaemonBindMode: prefs.localAPIBindMode,
-        daemonBindModeProvider: { prefs.localAPIBindMode }
+        daemonBindModeProvider: { prefs.localAPIBindMode },
+        activeProfileIDProvider: activeProfileIDProvider
       )
       let seed = ProcessInfo.processInfo.environment["PIE_TEST_CHAT_MODEL_PIN"]?
         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -303,7 +309,8 @@ struct RatioThinkApp: App {
     if let startToRunningPort {
       let store = EngineStatusStore(
         client: StartableStubXPCClient(port: startToRunningPort),
-        initialStatus: .stopped
+        initialStatus: .stopped,
+        activeProfileIDProvider: activeProfileIDProvider
       )
       // Not status-pinned: this seam drives real `.stopped`→`.running`
       // transitions and must keep polling.
@@ -313,7 +320,8 @@ struct RatioThinkApp: App {
     let store = EngineStatusStore(
       client: HelperXPCClient(),
       initialDaemonBindMode: prefs.localAPIBindMode,
-      daemonBindModeProvider: { prefs.localAPIBindMode }
+      daemonBindModeProvider: { prefs.localAPIBindMode },
+      activeProfileIDProvider: activeProfileIDProvider
     )
     return (store, enginePinned: false, residentSeed: nil)
   }
@@ -569,12 +577,6 @@ struct RatioThinkApp: App {
     Task {
       commandActionFeedback = .running("Restarting engine…")
       await Self.performHelperRegistrationReconcile()
-      guard let profileID = profileStore.activeProfileID,
-            !profileID.isEmpty else {
-        NSLog("Restart Engine: no active profile to start")
-        commandActionFeedback = .failed("No active profile is available to restart.")
-        return
-      }
       do {
         // #668: preserve the running session's served model across the restart
         // so a non-default pick (per-chat selection, Local API switch) is not
@@ -583,11 +585,13 @@ struct RatioThinkApp: App {
         let modelOverride = EngineRestartTarget.bootModel(
           currentSnapshot: engineStatusStore.currentSnapshot,
           lastServedModelID: profileStore.activeModelID)
-        try await engineStatusStore.startEngine(profileID: profileID,
-                                                modelOverride: modelOverride)
+        try await engineStatusStore.startOnActiveProfile(modelOverride: modelOverride)
         commandActionFeedback = .succeeded("Engine restart requested.")
+      } catch EngineStatusStore.ActiveProfileStartError.noActiveProfile {
+        NSLog("Restart Engine: no active profile to start")
+        commandActionFeedback = .failed("No active profile is available to restart.")
       } catch {
-        NSLog("Restart Engine: startEngine(\(profileID)) failed: \(error)")
+        NSLog("Restart Engine: startOnActiveProfile failed: \(error)")
         commandActionFeedback = .failed(ChatScaffoldView.engineErrorMessage(error, verb: "restart"))
       }
     }

@@ -118,12 +118,17 @@ public final class EngineStatusStore: ObservableObject {
     return nil
   }
 
+  public enum ActiveProfileStartError: Error, Equatable {
+    case noActiveProfile
+  }
+
   public func kvUsageSnapshot(for modelID: String) -> KVUsageSnapshot? {
     latestKVUsageSnapshots.first { $0.modelID == modelID }
   }
 
   private let client: any AppXPCClient
   private let daemonBindModeProvider: @MainActor @Sendable () -> EngineHTTPBindMode
+  private let activeProfileIDProvider: @MainActor @Sendable () -> String?
   /// Fast cadence — the interval used while the engine state is actively
   /// changing (transition tier: `.starting`/`.stopping`, an engine-death or
   /// transport-loss recovery episode). Named `pollInterval` for back-compat
@@ -225,6 +230,7 @@ public final class EngineStatusStore: ObservableObject {
     initialStatus: EngineStatus = .starting,
     initialDaemonBindMode: EngineHTTPBindMode = .loopback,
     daemonBindModeProvider: @escaping @MainActor @Sendable () -> EngineHTTPBindMode = { .loopback },
+    activeProfileIDProvider: @escaping @MainActor @Sendable () -> String? = { nil },
     tierPolicy: StatusTierPolicy = StatusTierPolicy(),
     now: @escaping @Sendable () -> Date = { Date() },
     sleepFor: @escaping @Sendable (TimeInterval) async -> Void = { seconds in
@@ -233,6 +239,7 @@ public final class EngineStatusStore: ObservableObject {
   ) {
     self.client = client
     self.daemonBindModeProvider = daemonBindModeProvider
+    self.activeProfileIDProvider = activeProfileIDProvider
     self.pollInterval = pollInterval
     self.steadyPollInterval = steadyPollInterval
     self.tierPolicy = tierPolicy
@@ -657,6 +664,18 @@ public final class EngineStatusStore: ObservableObject {
   /// boundary, so an `.alreadyRunning` that reaches here is an incompatible
   /// start (different profile, stopping, …) and surfaces to the caller rather
   /// than being swallowed.
+  public func startOnActiveProfile(modelOverride: String? = nil,
+                                   daemonBindHost: EngineHTTPBindMode? = nil) async throws {
+    guard let profileID = activeProfileIDProvider()?
+      .trimmingCharacters(in: .whitespacesAndNewlines),
+          !profileID.isEmpty else {
+      throw ActiveProfileStartError.noActiveProfile
+    }
+    try await startEngine(profileID: profileID,
+                          modelOverride: modelOverride,
+                          daemonBindHost: daemonBindHost)
+  }
+
   public func startEngine(profileID: String,
                           modelOverride: String? = nil,
                           daemonBindHost: EngineHTTPBindMode? = nil) async throws {

@@ -309,7 +309,6 @@ struct ChatScaffoldView: View {
   /// failure banner); a thrown transport error routes to
   /// `engineActionError` (PR#15 F3) — never the persistence banner.
   private func startEngineForSelectedProfile() {
-    let profileID = viewModel.selectedProfileID
     // Honor an explicit per-chat model pick as the boot model (#459 repro 1).
     // v1 pie loads the model at `pie serve` boot from the profile, so a
     // selection that only lives in App state would never reach the engine — a
@@ -326,7 +325,7 @@ struct ChatScaffoldView: View {
         helperBlock = nil
         // #616: the engine start call lives in the coordinator; the fault
         // routing below stays here.
-        try await engineCoordinator.startEngine(profileID: profileID, modelOverride: modelOverride)
+        try await engineCoordinator.startOnActiveProfile(modelOverride: modelOverride)
       } catch let block as HelperUnavailable {
         helperBlock = block
       } catch {
