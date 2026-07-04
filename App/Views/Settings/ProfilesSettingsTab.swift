@@ -45,12 +45,12 @@ struct ProfilesSettingsTab: View {
           .padding(12)
       }
 
-      // #702: a broken customization of a built-in was reverted to the app
-      // default on launch (the broken file saved as `.bak`). Non-fatal, so it
-      // renders as an informational notice rather than the red error block.
-      ForEach(profileStore.lastBuiltinRevertNotices, id: \.profileID) { notice in
+      // Non-fatal built-in migration notices render as informational messages
+      // rather than the red error block. Key by backup filename so same-origin
+      // retired files do not collapse into one SwiftUI row.
+      ForEach(profileStore.lastBuiltinRevertNotices, id: \.bakFilename) { notice in
         Label(
-          "\(notice.profileName) couldn’t be read — reverted to the app default; your file was saved as \(notice.bakFilename).",
+          notice.message,
           systemImage: "exclamationmark.triangle"
         )
         .foregroundStyle(.orange)

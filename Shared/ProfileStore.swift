@@ -482,6 +482,12 @@ public final class ProfileStore: ObservableObject {
     public let toml: String
   }
 
+  private struct HistoricalBuiltinFilename {
+    let filename: String
+    let originID: String
+    let shippedProfileID: String
+  }
+
   /// The built-ins, in display order. `tree-of-thought` (#413) and
   /// `best-of-n` (#690) are EXAMPLE profiles gated by `seedsExampleProfiles`
   /// (so hermetic tests can exclude them via
@@ -520,18 +526,36 @@ public final class ProfileStore: ObservableObject {
   /// superset of the current `baseBuiltins` filenames: when a built-in is
   /// RETIRED from `baseBuiltins`, leave its filename here so an
   /// already-installed (pre-marker) copy is still recognized as a dead
-  /// built-in — `migrateBuiltinProvenance` recognizes it by filename, stamps
-  /// the marker, and moves it aside (#718). `fast-think.toml` and
-  /// `repeat-boost.toml` now resolve to the retired `repeat-boost` origin, so
-  /// a recognized leftover is backed up/hidden rather than surfaced as current.
-  public static let historicalBuiltinFilenames: [String: String] = [
-    defaultChatFilename:        defaultProfileID,
-    defaultRepeatBoostFilename: defaultRepeatBoostProfileID,
-    treeOfThoughtFilename:      treeOfThoughtProfileID,
-    defaultJSONThinkFilename:   defaultJSONThinkProfileID,
-    bestOfNFilename:            bestOfNProfileID,
-    legacyFastThinkFilename:    defaultRepeatBoostProfileID,
-  ]
+  /// built-in and moves it aside (#718). `fast-think.toml` resolves to the
+  /// retired `repeat-boost` origin, but the filename originally shipped with
+  /// id `fast-think`; keep those facts separate so the recognizer can match
+  /// old on-disk bodies without treating profile id alone as provenance.
+  private static let historicalBuiltinFilenameRecords: [String: HistoricalBuiltinFilename] = {
+    let records = [
+      HistoricalBuiltinFilename(filename: defaultChatFilename,
+                                originID: defaultProfileID,
+                                shippedProfileID: defaultProfileID),
+      HistoricalBuiltinFilename(filename: defaultRepeatBoostFilename,
+                                originID: defaultRepeatBoostProfileID,
+                                shippedProfileID: defaultRepeatBoostProfileID),
+      HistoricalBuiltinFilename(filename: treeOfThoughtFilename,
+                                originID: treeOfThoughtProfileID,
+                                shippedProfileID: treeOfThoughtProfileID),
+      HistoricalBuiltinFilename(filename: defaultJSONThinkFilename,
+                                originID: defaultJSONThinkProfileID,
+                                shippedProfileID: defaultJSONThinkProfileID),
+      HistoricalBuiltinFilename(filename: bestOfNFilename,
+                                originID: bestOfNProfileID,
+                                shippedProfileID: bestOfNProfileID),
+      HistoricalBuiltinFilename(filename: legacyFastThinkFilename,
+                                originID: defaultRepeatBoostProfileID,
+                                shippedProfileID: legacyFastThinkProfileID),
+    ]
+    return Dictionary(uniqueKeysWithValues: records.map { ($0.filename, $0) })
+  }()
+
+  public static let historicalBuiltinFilenames: [String: String] =
+    historicalBuiltinFilenameRecords.mapValues(\.originID)
 
   /// Non-fatal notice (#702): a user's customization of a built-in failed to
   /// parse, so the migration moved the broken file aside (`bakFilename`) and
@@ -540,14 +564,31 @@ public final class ProfileStore: ObservableObject {
   /// otherwise the revert is silent (log-only) and a broken customization
   /// looks identical to "the default was always like this".
   public struct BuiltinRevertNotice: Equatable, Sendable {
+    public enum Reason: Equatable, Sendable {
+      case parseFailure
+      case retired
+    }
+
     public let profileID: String
     public let profileName: String
     public let bakFilename: String
+    public let reason: Reason
 
-    public init(profileID: String, profileName: String, bakFilename: String) {
+    public init(profileID: String, profileName: String, bakFilename: String,
+                reason: Reason = .parseFailure) {
       self.profileID = profileID
       self.profileName = profileName
       self.bakFilename = bakFilename
+      self.reason = reason
+    }
+
+    public var message: String {
+      switch reason {
+      case .parseFailure:
+        return "\(profileName) couldn’t be read — reverted to the app default; your file was saved as \(bakFilename)."
+      case .retired:
+        return "\(profileName): this built-in was retired; your copy was saved as \(bakFilename)."
+      }
     }
   }
 
@@ -932,7 +973,7 @@ public final class ProfileStore: ObservableObject {
       //     seeded via the base TOML constants and rides the override dump.
       //     Runs after the dedup pass so `migrateSeededBuiltins` has already
       //     cleared byte-equal current stock copies first.
-      let provenanceError = self.migrateBuiltinProvenance()
+      let (provenanceError, provenanceNotices) = self.migrateBuiltinProvenance()
       // #718 F3a: three independent migration error domains share one
       // `_builtinSeedError` slot. The old priority `??` reported
       // `provenanceError` ONLY when both earlier migrations succeeded, so a
@@ -966,8 +1007,9 @@ public final class ProfileStore: ObservableObject {
         // A built-in dedup/backup failure rides its own channel so it
         // surfaces even when `_entries` is non-empty (review v1 F1).
         self._builtinSeedError = builtinSeedError
-        // Non-fatal #702 reverts: successful .bak moves of broken overrides.
-        self._builtinRevertNotices = revertNotices
+        // Non-fatal reverts: successful .bak moves of broken overrides and
+        // retired built-ins that were previously visible.
+        self._builtinRevertNotices = revertNotices + provenanceNotices
         self.commitActiveReadResultLocked(readResult, source: .start)
         //  review v1 F2: a marker-seed failure must NOT
         // be silent. The override below fills `_activeProfileError`
@@ -1794,12 +1836,13 @@ public final class ProfileStore: ObservableObject {
   /// provenance and hide it if the built-in it descends from is RETIRED:
   ///
   ///   · Provenance = the `builtin-origin` marker if present, else — for a
-  ///     file at a historical built-in FILENAME — the mapped origin id only
-  ///     when it cannot be parsed/read (a broken/unreadable built-in at a known
-  ///     filename, #718 F4). A valid unmarked profile, even at a historical
-  ///     filename/id such as a user-authored `repeat-boost.toml`, is treated as
-  ///     USER-AUTHORED and left untouched — the #709/#706/#856 invariant that
-  ///     genuine user profiles are never removed.
+  ///     file at a historical built-in FILENAME — the mapped origin id when
+  ///     the file cannot be parsed/read OR when the parsed profile id matches
+  ///     the id that filename shipped with. This whitelist recognizer catches
+  ///     valid pre-marker stock copies without using a growing retired-id
+  ///     blacklist. A user file sharing BOTH a retired built-in's historical
+  ///     filename and shipped id is moved aside; the tradeoff is reversible
+  ///     because the original file is preserved as `.bak`.
   ///   · provenance id no longer in the SHIPPED set -> a built-in a newer
   ///     version RETIRED: MOVE to a non-colliding `<name>.toml.bak` so it
   ///     stops being scanned (and `mergeEffective` hides any marked copy that
@@ -1809,18 +1852,20 @@ public final class ProfileStore: ObservableObject {
   /// The historical filename map is what catches an ALREADY-INSTALLED stale
   /// built-in (no version ships the marker yet); the marker is the
   /// id-independent discriminator going forward. Idempotent: a shipped or
-  /// user-authored file is left in place. Returns the first move failure
+  /// different-id user-authored file is left in place. Returns the first move failure
   /// (rides the shared `_builtinSeedError` channel; the caller surfaces it
   /// with priority, #718 F3); a failure on one file never blocks the rest. A
   /// move FAILURE leaves the file on disk where `mergeEffective` still hides
   /// the marked copy — intentional: the built-in is correctly gone from the
   /// picker AND the failure is loud via `directoryError`, not silent.
-  private func migrateBuiltinProvenance() -> ProfileStoreError? {
+  private func migrateBuiltinProvenance()
+    -> (error: ProfileStoreError?, reverts: [BuiltinRevertNotice]) {
     let fm = FileManager.default
     let urls = ((try? fm.contentsOfDirectory(
       at: directory, includingPropertiesForKeys: nil,
       options: [.skipsHiddenFiles])) ?? []).filter(Self.isProfileTOML)
     var firstError: ProfileStoreError?
+    var reverts: [BuiltinRevertNotice] = []
     for url in urls {
       let filename = url.lastPathComponent
       // #718 F4: an unreadable file is NOT silently skipped — log it (mirroring
@@ -1836,9 +1881,9 @@ public final class ProfileStore: ObservableObject {
       let origin: String?
       if let marker = profile?.builtinOrigin {
         origin = marker
-      } else if let filenameOrigin = Self.historicalBuiltinFilenames[filename],
-                profile == nil {
-        origin = filenameOrigin
+      } else if let historical = Self.historicalBuiltinFilenameRecords[filename],
+                profile?.id == historical.shippedProfileID || profile == nil {
+        origin = historical.originID
       } else {
         origin = nil
       }
@@ -1849,13 +1894,19 @@ public final class ProfileStore: ObservableObject {
       do {
         try fm.moveItem(at: url, to: bak)
         Log.store.info("migrateBuiltinProvenance: retired built-in \(filename, privacy: .public) (origin \(origin, privacy: .public) no longer shipped) moved to \(bak.lastPathComponent, privacy: .public)")
+        if let profile {
+          reverts.append(BuiltinRevertNotice(profileID: origin,
+                                             profileName: profile.name,
+                                             bakFilename: bak.lastPathComponent,
+                                             reason: .retired))
+        }
       } catch {
         let underlying = String(describing: error)
         Log.store.error("migrateBuiltinProvenance: back up retired \(filename, privacy: .public) failed: \(underlying, privacy: .public)")
         if firstError == nil { firstError = .seedFailed(path: url.path, underlying: underlying) }
       }
     }
-    return firstError
+    return (firstError, reverts)
   }
 
   /// A `<name>.toml.bak` URL that does NOT overwrite an existing backup the

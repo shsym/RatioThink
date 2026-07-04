@@ -2457,6 +2457,9 @@ final class ProfileStoreTests: XCTestCase {
       let notice = try XCTUnwrap(notices.first { $0.profileID == "json-think" })
       XCTAssertEqual(notice.profileName, "JSON Think")
       XCTAssertEqual(notice.bakFilename, "json-think.toml.bak")
+      XCTAssertEqual(notice.reason, .parseFailure)
+      XCTAssertEqual(notice.message,
+                     "JSON Think couldn’t be read — reverted to the app default; your file was saved as json-think.toml.bak.")
 
       // The broken file was moved aside; no move FAILURE, so directoryError is
       // clean (the revert is non-fatal, not a _builtinSeedError).
@@ -2849,7 +2852,7 @@ final class ProfileStoreTests: XCTestCase {
     }
   }
 
-  func test_unmarked_user_authored_repeat_boost_file_survives_retirement() throws {
+  func test_valid_unmarked_retired_repeat_boost_file_is_moved_aside() throws {
     try withTempProfilesDir { dir in
       let edited = """
       id = "repeat-boost"
@@ -2866,11 +2869,105 @@ final class ProfileStoreTests: XCTestCase {
       try store.start()
       defer { store.stop() }
 
+      let fm = FileManager.default
+      XCTAssertFalse(fm.fileExists(atPath: url.path),
+                     "a valid unmarked retired built-in at its historical filename must be moved aside")
+      XCTAssertEqual(try String(contentsOf: url.appendingPathExtension("bak"), encoding: .utf8), edited,
+                     "the retired built-in must be preserved as a .bak")
+      XCTAssertNil(store.entries.first { $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID },
+                   "the retired built-in must no longer appear in the picker")
+      XCTAssertEqual(store.lastBuiltinRevertNotices,
+                     [ProfileStore.BuiltinRevertNotice(
+                      profileID: ProfileStore.defaultRepeatBoostProfileID,
+                      profileName: "My Repeat Boost",
+                      bakFilename: ProfileStore.defaultRepeatBoostFilename + ".bak",
+                      reason: .retired)],
+                     "moving aside a previously visible retired profile must surface a notice")
+      XCTAssertEqual(store.lastBuiltinRevertNotices.first?.message,
+                     "My Repeat Boost: this built-in was retired; your copy was saved as repeat-boost.toml.bak.")
+    }
+  }
+
+  func test_valid_unmarked_current_builtin_copy_is_left_in_place() throws {
+    try withTempProfilesDir { dir in
+      let edited = """
+      id = "json-think"
+      name = "My JSON Think"
+      model = "m"
+      inferlet = "chat-apc"
+      """
+      let url = dir.appendingPathComponent(ProfileStore.defaultJSONThinkFilename)
+      try edited.write(to: url, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
       XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), edited,
-                     "an unmarked user-authored repeat-boost.toml must be preserved, not retired")
-      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID })
+                     "a current built-in filename+id is still shipped and must not be moved aside")
+      XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + ".bak"),
+                     "current built-ins are not retirement backups")
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == ProfileStore.defaultJSONThinkProfileID })
+      XCTAssertEqual(entry.profile?.name, "My JSON Think")
+    }
+  }
+
+  func test_user_profile_at_retired_builtin_filename_with_different_id_is_kept() throws {
+    try withTempProfilesDir { dir in
+      let edited = """
+      id = "my-repeat-boost"
+      name = "My Repeat Boost"
+      model = "m"
+      inferlet = "chat-apc"
+
+      [speculation]
+      enabled = true
+      """
+      let url = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
+      try edited.write(to: url, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), edited,
+                     "a user-authored profile with a different id must not be moved aside")
+      XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + ".bak"),
+                     "different-id user profiles are not retirement backups")
+      let entry = try XCTUnwrap(store.entries.first { $0.profile?.id == "my-repeat-boost" })
       XCTAssertEqual(entry.profile?.name, "My Repeat Boost")
       XCTAssertEqual(entry.profile?.speculation, Profile.Speculation(enabled: true))
+    }
+  }
+
+  func test_valid_unmarked_legacy_fast_think_file_is_moved_aside_after_rename() throws {
+    try withTempProfilesDir { dir in
+      let edited = """
+      id = "fast-think"
+      name = "My Fast Think"
+      model = "m"
+      inferlet = "chat-apc"
+
+      [speculation]
+      enabled = true
+      """
+      let legacyURL = dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename)
+      let repeatBoostURL = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
+      try edited.write(to: legacyURL, atomically: true, encoding: .utf8)
+
+      let store = ProfileStore(directory: dir)
+      try store.start()
+      defer { store.stop() }
+
+      XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path),
+                     "the fast-think rename migration removes the legacy file")
+      XCTAssertFalse(FileManager.default.fileExists(atPath: repeatBoostURL.path),
+                     "the renamed retired built-in must also be moved aside")
+      let bak = repeatBoostURL.appendingPathExtension("bak")
+      XCTAssertTrue(FileManager.default.fileExists(atPath: bak.path),
+                    "the renamed retired built-in must be preserved as .bak")
+      XCTAssertNil(store.entries.first { $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID },
+                   "the retired renamed built-in must no longer appear in the picker")
     }
   }
 
@@ -2951,25 +3048,21 @@ final class ProfileStoreTests: XCTestCase {
       let targetURL = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
       XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path),
                      "legacy fast-think.toml must be removed after migration")
-      XCTAssertTrue(FileManager.default.fileExists(atPath: targetURL.path),
-                    "migration must produce repeat-boost.toml")
+      XCTAssertFalse(FileManager.default.fileExists(atPath: targetURL.path),
+                     "migration produces repeat-boost.toml, then strict retirement moves it aside")
 
-      let migrated = try String(contentsOf: targetURL, encoding: .utf8)
+      let bakURL = targetURL.appendingPathExtension("bak")
+      let migrated = try String(contentsOf: bakURL, encoding: .utf8)
       XCTAssertEqual(migrated, edited.replacingOccurrences(
         of: "id = \"fast-think\"", with: "id = \"repeat-boost\""),
-        "only the id line is rewritten; every user edit survives")
+        "only the id line is rewritten before backup; every user edit survives")
 
-      // Exactly one built-in (no duplicate) and it resolves under the new id.
-      let entry = try XCTUnwrap(store.entries.first {
-        $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID
-      })
-      XCTAssertEqual(entry.profile?.name, "My Fast Think")
-      XCTAssertEqual(entry.profile?.sampling.maxTokens, 4096,
-                     "preserved sampling edit")
+      XCTAssertNil(store.entries.first { $0.profile?.id == ProfileStore.defaultRepeatBoostProfileID },
+                   "retired repeat-boost must not remain visible after rename")
       XCTAssertEqual(store.entries.filter {
         $0.url.lastPathComponent == ProfileStore.legacyFastThinkFilename
         || $0.url.lastPathComponent == ProfileStore.defaultRepeatBoostFilename
-      }.count, 1, "no duplicate built-in after migration")
+      }.count, 0, "no duplicate built-in after migration")
     }
   }
 
@@ -3001,7 +3094,7 @@ final class ProfileStoreTests: XCTestCase {
   func test_migration_is_idempotent_when_already_migrated() throws {
     try withTempProfilesDir { dir in
       // Already-migrated install: only repeat-boost.toml exists (edited),
-      // no legacy file. A relaunch must not touch it.
+      // no legacy file. A relaunch treats it as a retired built-in copy.
       let edited = """
       id = "repeat-boost"
       name = "Edited"
@@ -3018,8 +3111,10 @@ final class ProfileStoreTests: XCTestCase {
       try store.start()
       defer { store.stop() }
 
-      XCTAssertEqual(try String(contentsOf: targetURL, encoding: .utf8), edited,
-                     "an already-migrated repeat-boost.toml must be left untouched")
+      XCTAssertFalse(FileManager.default.fileExists(atPath: targetURL.path),
+                     "an already-migrated repeat-boost.toml must be moved aside once retired")
+      XCTAssertEqual(try String(contentsOf: targetURL.appendingPathExtension("bak"), encoding: .utf8), edited,
+                     "the retired already-migrated copy must be preserved as .bak")
       XCTAssertFalse(FileManager.default.fileExists(
         atPath: dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename).path),
         "no legacy file should be created")
@@ -3055,9 +3150,11 @@ final class ProfileStoreTests: XCTestCase {
       XCTAssertFalse(FileManager.default.fileExists(
         atPath: dir.appendingPathComponent(ProfileStore.legacyFastThinkFilename).path),
         "legacy leftover must be deduped away")
-      XCTAssertEqual(try String(contentsOf:
-        dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename), encoding: .utf8),
-        target, "the pre-existing repeat-boost.toml must remain authoritative")
+      let targetURL = dir.appendingPathComponent(ProfileStore.defaultRepeatBoostFilename)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: targetURL.path),
+                     "the pre-existing repeat-boost.toml is authoritative, then retired")
+      XCTAssertEqual(try String(contentsOf: targetURL.appendingPathExtension("bak"), encoding: .utf8),
+                     target, "the authoritative repeat-boost.toml must be preserved as .bak")
     }
   }
 
