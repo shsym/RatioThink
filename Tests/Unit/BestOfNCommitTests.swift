@@ -53,4 +53,43 @@ final class BestOfNCommitTests: XCTestCase {
                    "candidate snapshots must NOT be released before the answer is durable — "
                      + "discarding recovery state on a failed save could lose the selected answer")
   }
+
+  func test_thinkMore_blocked_dispatch_preserves_live_round_and_draft() {
+    let message = Message(role: "assistant", content: "")
+    var didSave = false
+    var didClearDraft = false
+
+    let committed = ChatScaffoldView.finishBestOfNThinkMore(
+      dispatched: false,
+      pickedText: "the chosen answer",
+      on: message,
+      save: { didSave = true },
+      report: { _ in },
+      clearDraft: { didClearDraft = true })
+
+    XCTAssertFalse(committed)
+    XCTAssertEqual(message.content, "",
+                   "a blocked Refine must leave the level-1 pick uncommitted so the round stays live")
+    XCTAssertFalse(didSave)
+    XCTAssertFalse(didClearDraft,
+                   "the guidance draft must remain available when the round was not dispatched")
+  }
+
+  func test_thinkMore_dispatched_round_commits_and_clears_draft() {
+    let message = Message(role: "assistant", content: "")
+    var didClearDraft = false
+
+    let committed = ChatScaffoldView.finishBestOfNThinkMore(
+      dispatched: true,
+      pickedText: "the chosen answer",
+      on: message,
+      save: {},
+      report: { _ in },
+      clearDraft: { didClearDraft = true })
+
+    XCTAssertTrue(committed)
+    XCTAssertEqual(message.content, "the chosen answer")
+    XCTAssertTrue(didClearDraft,
+                  "once round 2 is dispatched, the level-1 round locks into history and its consumed draft is cleared")
+  }
 }

@@ -1073,15 +1073,20 @@ struct ChatScaffoldView: View {
       // the picked answer into `messages` would double it.) Then commit the
       // picked text so the level-1 round locks into read-only history and drops
       // out of live-candidacy while the level-2 round becomes interactive.
+      let dispatched: Bool
       if BestOfNRoundSeed.shouldInlineSecondRoundForUITest {
         BestOfNRoundSeed.appendSecondRound(after: message, in: chat, inboundComment: selectedComment)
+        dispatched = true
       } else {
-        sendBestOfNRound(for: chat, resume: resume)
+        dispatched = sendBestOfNRound(for: chat, resume: resume)
       }
-      _ = Self.commitBestOfNAnswer(pickedText, on: message, save: saveContext, report: reportSave)
-      // #736: the guidance draft has been consumed into the resume; drop it so
-      // it can't leak into a future round on this (now-committed) message id.
-      bestOfNCommentDrafts[messageID] = nil
+      _ = Self.finishBestOfNThinkMore(
+        dispatched: dispatched,
+        pickedText: pickedText,
+        on: message,
+        save: saveContext,
+        report: reportSave,
+        clearDraft: { bestOfNCommentDrafts[messageID] = nil })
     }
   }
 
@@ -1135,6 +1140,23 @@ struct ChatScaffoldView: View {
     releaseSnapshots()
   }
 
+  @discardableResult
+  static func finishBestOfNThinkMore(
+    dispatched: Bool,
+    pickedText: String,
+    on message: Message,
+    save: () throws -> Void,
+    report: (Error) -> Void,
+    clearDraft: () -> Void
+  ) -> Bool {
+    guard dispatched else { return false }
+    guard commitBestOfNAnswer(pickedText, on: message, save: save, report: report) else {
+      return false
+    }
+    clearDraft()
+    return true
+  }
+
   /// Best-effort release of a set of Best-of-N candidate KV snapshots (#690
   /// terminal cleanup). No-op when the engine is not ready or the set is empty.
   private func releaseBestOfNSnapshots(_ names: [String], in chat: Chat) {
@@ -1157,10 +1179,10 @@ struct ChatScaffoldView: View {
   /// Send Best-of-N round 2 expanding from the user's level-1 pick and
   /// refinement comment. Mirrors the round-1 route in `sendAssistantTurn` but
   /// threads the `resume` payload.
-  private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) {
-    guard let modelID = resolvedModelIDForSend(for: chat) else { return }
+  private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) -> Bool {
+    guard let modelID = resolvedModelIDForSend(for: chat) else { return false }
     guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
-          let bonConfig = bonProfile.bestOfN else { return }
+          let bonConfig = bonProfile.bestOfN else { return false }
     let options = ChatSendRequestOptions(
       modelID: modelID,
       sampling: bonProfile.bestOfNRequestSampling,
@@ -1180,6 +1202,7 @@ struct ChatScaffoldView: View {
       persistenceStatus: persistenceStatus,
       options: options,
       resume: resume)
+    return true
   }
 
   private func sendAssistantTurn(for chat: Chat) {
