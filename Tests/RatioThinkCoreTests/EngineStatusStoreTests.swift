@@ -292,6 +292,32 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.runtimeDaemonBindMode, .external)
   }
 
+  func test_startOnActiveProfile_uses_fallback_when_active_profile_missing() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      activeProfileIDProvider: { nil }
+    )
+
+    try await store.startOnActiveProfile(fallbackProfileID: "local-api")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "local-api")
+  }
+
+  func test_startOnActiveProfile_prefers_active_profile_over_fallback() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      activeProfileIDProvider: { "chat" }
+    )
+
+    try await store.startOnActiveProfile(fallbackProfileID: "local-api")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+  }
+
   func test_startOnActiveProfile_without_active_profile_refuses_before_xpc() async throws {
     let client = StubXPCClient()
     let store = EngineStatusStore(

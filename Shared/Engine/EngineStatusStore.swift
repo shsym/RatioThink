@@ -665,9 +665,13 @@ public final class EngineStatusStore: ObservableObject {
   /// start (different profile, stopping, …) and surfaces to the caller rather
   /// than being swallowed.
   public func startOnActiveProfile(modelOverride: String? = nil,
-                                   daemonBindHost: EngineHTTPBindMode? = nil) async throws {
-    guard let profileID = activeProfileIDProvider()?
-      .trimmingCharacters(in: .whitespacesAndNewlines),
+                                   daemonBindHost: EngineHTTPBindMode? = nil,
+                                   fallbackProfileID: String? = nil) async throws {
+    let providerProfileID = activeProfileIDProvider()?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let fallbackProfileID = fallbackProfileID?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let profileID = (providerProfileID?.isEmpty == false ? providerProfileID : fallbackProfileID),
           !profileID.isEmpty else {
       throw ActiveProfileStartError.noActiveProfile
     }

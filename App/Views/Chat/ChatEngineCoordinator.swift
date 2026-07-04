@@ -88,9 +88,11 @@ final class ChatEngineCoordinator: ObservableObject {
   }
 
   func startOnActiveProfile(modelOverride: String? = nil,
-                            daemonBindHost: EngineHTTPBindMode? = nil) async throws {
+                            daemonBindHost: EngineHTTPBindMode? = nil,
+                            fallbackProfileID: String? = nil) async throws {
     try await engineStatus.startOnActiveProfile(modelOverride: modelOverride,
-                                                daemonBindHost: daemonBindHost)
+                                                daemonBindHost: daemonBindHost,
+                                                fallbackProfileID: fallbackProfileID)
   }
 
   /// #397 F1: re-poll the helper after an unreachable-transport failure. The

@@ -625,11 +625,13 @@ struct LocalAPIView: View {
   /// `.alreadyRunning` that reaches the app is an incompatible-start
   /// conflict and surfaces to the caller.
   private func start() {
+    let fallbackProfileID = startProfileID
     Task { @MainActor in
       engineActionError = nil
       helperBlock = nil
       do {
-        try await engineCoordinator.startOnActiveProfile(daemonBindHost: bindMode)
+        try await engineCoordinator.startOnActiveProfile(daemonBindHost: bindMode,
+                                                         fallbackProfileID: fallbackProfileID)
       } catch let block as HelperUnavailable {
         helperBlock = block
       } catch {
