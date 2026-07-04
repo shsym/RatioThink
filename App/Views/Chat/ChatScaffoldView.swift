@@ -161,20 +161,20 @@ struct ChatScaffoldView: View {
     }
   }
 
-  enum SendGateAction: Equatable {
-    case send(modelID: String)
-    case presentNoModelPrompt
-    case presentPinnedModelMismatch(pinnedModelID: String, residentModelID: String)
-  }
-
-  static func sendGateAction(for decision: SendGateDecision) -> SendGateAction {
+  static func resolvedModelIDForSend(
+    decision: SendGateDecision,
+    presentNoModelPrompt: () -> Void,
+    presentPinnedModelMismatch: (_ pinnedModelID: String, _ residentModelID: String) -> Void
+  ) -> String? {
     switch decision {
     case .ready(let modelID):
-      return .send(modelID: modelID)
+      return modelID
     case .noResolvableModel:
-      return .presentNoModelPrompt
+      presentNoModelPrompt()
+      return nil
     case .pinnedModelMismatch(let pinned, let resident):
-      return .presentPinnedModelMismatch(pinnedModelID: pinned, residentModelID: resident)
+      presentPinnedModelMismatch(pinned, resident)
+      return nil
     }
   }
   /// #513: the assistant message id awaiting the destructive-retry
@@ -1158,18 +1158,7 @@ struct ChatScaffoldView: View {
   /// refinement comment. Mirrors the round-1 route in `sendAssistantTurn` but
   /// threads the `resume` payload.
   private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) {
-    let modelID: String
-    switch Self.sendGateAction(for: sendGateDecision(for: chat)) {
-    case .send(let readyModelID):
-      modelID = readyModelID
-    case .presentPinnedModelMismatch(let pinned, let resident):
-      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
-                                                residentModelID: resident)
-      return
-    case .presentNoModelPrompt:
-      presentNoModelPrompt()
-      return
-    }
+    guard let modelID = resolvedModelIDForSend(for: chat) else { return }
     guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
           let bonConfig = bonProfile.bestOfN else { return }
     let options = ChatSendRequestOptions(
@@ -1198,18 +1187,7 @@ struct ChatScaffoldView: View {
     // passed, but never ask the engine to load a model the user did not
     // choose, and never send a pinned model into a known different resident
     // engine (#527).
-    let modelID: String
-    switch Self.sendGateAction(for: sendGateDecision(for: chat)) {
-    case .send(let readyModelID):
-      modelID = readyModelID
-    case .presentPinnedModelMismatch(let pinned, let resident):
-      pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
-                                                residentModelID: resident)
-      return
-    case .presentNoModelPrompt:
-      presentNoModelPrompt()
-      return
-    }
+    guard let modelID = resolvedModelIDForSend(for: chat) else { return }
     // Abandon cleanup (#690): starting a new turn orphans any uncommitted
     // Best-of-N round in this chat — free its candidate snapshots now so a long
     // session cannot accumulate unpicked KV. Runs before this turn is added, so
@@ -1346,6 +1324,16 @@ struct ChatScaffoldView: View {
       selectedModelID: chat.modelID,
       profileDefaultModel: selectedProfileDefault,
       residentModelID: modelLoadCenter.residentModelID)
+  }
+
+  private func resolvedModelIDForSend(for chat: Chat) -> String? {
+    Self.resolvedModelIDForSend(
+      decision: sendGateDecision(for: chat),
+      presentNoModelPrompt: presentNoModelPrompt,
+      presentPinnedModelMismatch: { pinned, resident in
+        pinnedModelMismatch = PinnedModelMismatch(pinnedModelID: pinned,
+                                                  residentModelID: resident)
+      })
   }
 
   private func handleBlockedSend(draft: String, for chat: Chat) {
