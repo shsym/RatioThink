@@ -564,14 +564,31 @@ public final class ProfileStore: ObservableObject {
   /// otherwise the revert is silent (log-only) and a broken customization
   /// looks identical to "the default was always like this".
   public struct BuiltinRevertNotice: Equatable, Sendable {
+    public enum Reason: Equatable, Sendable {
+      case parseFailure
+      case retired
+    }
+
     public let profileID: String
     public let profileName: String
     public let bakFilename: String
+    public let reason: Reason
 
-    public init(profileID: String, profileName: String, bakFilename: String) {
+    public init(profileID: String, profileName: String, bakFilename: String,
+                reason: Reason = .parseFailure) {
       self.profileID = profileID
       self.profileName = profileName
       self.bakFilename = bakFilename
+      self.reason = reason
+    }
+
+    public var message: String {
+      switch reason {
+      case .parseFailure:
+        return "\(profileName) couldn’t be read — reverted to the app default; your file was saved as \(bakFilename)."
+      case .retired:
+        return "\(profileName): this built-in was retired; your copy was saved as \(bakFilename)."
+      }
     }
   }
 
@@ -1819,12 +1836,13 @@ public final class ProfileStore: ObservableObject {
   /// provenance and hide it if the built-in it descends from is RETIRED:
   ///
   ///   · Provenance = the `builtin-origin` marker if present, else — for a
-  ///     file at a historical built-in FILENAME — the mapped origin id only
-  ///     when it cannot be parsed/read (a broken/unreadable built-in at a known
-  ///     filename, #718 F4). A valid unmarked profile, even at a historical
-  ///     filename/id such as a user-authored `repeat-boost.toml`, is treated as
-  ///     USER-AUTHORED and left untouched — the #709/#706/#856 invariant that
-  ///     genuine user profiles are never removed.
+  ///     file at a historical built-in FILENAME — the mapped origin id when
+  ///     the file cannot be parsed/read OR when the parsed profile id matches
+  ///     the id that filename shipped with. This whitelist recognizer catches
+  ///     valid pre-marker stock copies without using a growing retired-id
+  ///     blacklist. A user file sharing BOTH a retired built-in's historical
+  ///     filename and shipped id is moved aside; the tradeoff is reversible
+  ///     because the original file is preserved as `.bak`.
   ///   · provenance id no longer in the SHIPPED set -> a built-in a newer
   ///     version RETIRED: MOVE to a non-colliding `<name>.toml.bak` so it
   ///     stops being scanned (and `mergeEffective` hides any marked copy that
@@ -1834,7 +1852,7 @@ public final class ProfileStore: ObservableObject {
   /// The historical filename map is what catches an ALREADY-INSTALLED stale
   /// built-in (no version ships the marker yet); the marker is the
   /// id-independent discriminator going forward. Idempotent: a shipped or
-  /// user-authored file is left in place. Returns the first move failure
+  /// different-id user-authored file is left in place. Returns the first move failure
   /// (rides the shared `_builtinSeedError` channel; the caller surfaces it
   /// with priority, #718 F3); a failure on one file never blocks the rest. A
   /// move FAILURE leaves the file on disk where `mergeEffective` still hides
@@ -1879,7 +1897,8 @@ public final class ProfileStore: ObservableObject {
         if let profile {
           reverts.append(BuiltinRevertNotice(profileID: origin,
                                              profileName: profile.name,
-                                             bakFilename: bak.lastPathComponent))
+                                             bakFilename: bak.lastPathComponent,
+                                             reason: .retired))
         }
       } catch {
         let underlying = String(describing: error)

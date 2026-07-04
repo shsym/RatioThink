@@ -2457,6 +2457,9 @@ final class ProfileStoreTests: XCTestCase {
       let notice = try XCTUnwrap(notices.first { $0.profileID == "json-think" })
       XCTAssertEqual(notice.profileName, "JSON Think")
       XCTAssertEqual(notice.bakFilename, "json-think.toml.bak")
+      XCTAssertEqual(notice.reason, .parseFailure)
+      XCTAssertEqual(notice.message,
+                     "JSON Think couldn’t be read — reverted to the app default; your file was saved as json-think.toml.bak.")
 
       // The broken file was moved aside; no move FAILURE, so directoryError is
       // clean (the revert is non-fatal, not a _builtinSeedError).
@@ -2877,8 +2880,11 @@ final class ProfileStoreTests: XCTestCase {
                      [ProfileStore.BuiltinRevertNotice(
                       profileID: ProfileStore.defaultRepeatBoostProfileID,
                       profileName: "My Repeat Boost",
-                      bakFilename: ProfileStore.defaultRepeatBoostFilename + ".bak")],
+                      bakFilename: ProfileStore.defaultRepeatBoostFilename + ".bak",
+                      reason: .retired)],
                      "moving aside a previously visible retired profile must surface a notice")
+      XCTAssertEqual(store.lastBuiltinRevertNotices.first?.message,
+                     "My Repeat Boost: this built-in was retired; your copy was saved as repeat-boost.toml.bak.")
     }
   }
 
