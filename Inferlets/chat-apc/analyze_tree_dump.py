@@ -1,8 +1,8 @@
 """Offline mechanism analysis of a ToT tree dump (#657 gap autopsy).
 
-Reads the JSONL produced by tot_wasm_before.py with DUMP_TREE=1 (one record per
-prompt: prompt, reference, grader, selected, final_answer, nodes[]) and answers
-WHY the wasm math arm trails the python faithful harness — without any engine.
+Reads a ToT tree-dump JSONL (one record per prompt: prompt, reference, grader,
+selected, final_answer, nodes[]) and answers WHY a run trails its comparison
+baseline — without any engine.
 
 Per prompt it grades EVERY node's content with grade.py (the same oracle) and
 classifies, for failures:
