@@ -77,7 +77,7 @@ endef
         test-gui-script test-gui-history test-gui-first-launch-package test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui test-ssh test-all \
         test-gui-shell test-gui-first-launch test-gui-helper test-gui-chat test-gui-chat-lifecycle test-gui-chat-switch test-gui-bestofn test-gui-local-api test-gui-no-surprise test-gui-menu test-gui-engine-status test-gui-model-download test-menubar-icon-template \
         test-e2e-engine test-e2e-large-model test-e2e-models test-e2e-chat test-e2e-tot test-e2e-tot-batched test-e2e-budget-sweep bench-tot test-e2e-full test-e2e-package test-tot-leak test-helper-respawn test-helper-recovery test-quit-structured \
-        test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-apc-bench-selftest test-e2e-harsh-load test-e2e-cache-real test-e2e-apc-divergence bench-apc-real \
+        test-real-pie-driver-contract test-sanitizer-canary test-gmake-recipe-canary test-harsh-load-selftest test-apc-bench-selftest test-e2e-harsh-load test-e2e-cache-real test-e2e-apc-divergence test-e2e-bestofn-regen bench-apc-real \
         engine-build engine-clean engine-bundle dmg-arm64 dmg-x86_64 \
         release-dmg-arm64 release-dmg-x86_64 release-preflight test-release \
         build-inferlets stamp-inferlets verify-inferlets verify-inferlets-inputs \
@@ -474,6 +474,15 @@ test-e2e-apc-divergence: $(LOGDIR) ## REAL-engine APC regression guard: a client
 	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-apc-divergence.log; \
 	  uv run --project Vendor/pie/client/python --with httpx \
 	    python Inferlets/chat-apc/apc_divergence_probe.py 2>&1 | tee $$LOG | tail -30; \
+	  status=$${PIPESTATUS[0]}; \
+	  echo "log: $$LOG"; \
+	  exit $$status
+
+test-e2e-bestofn-regen: $(LOGDIR) ## REAL-engine Best-of-N regenerate guard: re-sending an IDENTICAL round must still save every candidate. Candidate snapshots are named positionally (bon/<req>/<lvl>/<idx>), so a repeat collides on every name; before the delete-before-save fix all 5 branches errored with "candidate KV could not be saved for resume" and the round returned no_candidates. Operator-gated, NOT CI; needs real weights.
+	@set +e +o pipefail; \
+	  LOG=$(LOGDIR)/test-$$(date +%Y%m%d-%H%M%S)-bestofn-regen.log; \
+	  uv run --project Vendor/pie/client/python --with httpx \
+	    python Inferlets/chat-apc/bestofn_regen_probe.py 2>&1 | tee $$LOG | tail -30; \
 	  status=$${PIPESTATUS[0]}; \
 	  echo "log: $$LOG"; \
 	  exit $$status

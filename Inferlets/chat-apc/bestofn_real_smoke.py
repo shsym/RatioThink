@@ -60,7 +60,35 @@ MODEL_PATH = Path(
 )
 
 N = int(os.environ.get("BESTOFN_SMOKE_N", "5"))
+# Optional long-history pressure: prepend this many synthetic turns so the
+# Best-of-N fan-out runs against a realistic KV footprint rather than a
+# one-line prompt. Default 0 keeps the committed smoke unchanged.
+HISTORY_TURNS = int(os.environ.get("BESTOFN_SMOKE_HISTORY_TURNS", "0"))
+# The app runs Best-of-N with maxOutputTokens=32768; the committed smoke used
+# 96, so it never exercised the KV footprint a real candidate can reach.
+MAX_TOK_PER_CAND = int(os.environ.get("BESTOFN_SMOKE_MAX_TOK", "96"))
+# Shrink the KV pool to emulate a low-memory machine. Default 0 = leave the
+# engine default (1024 pages x 32 tokens = 32,768). Smaller pools use LESS
+# host memory, so this is safe to run anywhere; it is how a machine that
+# actually runs out of pages gets reproduced on one that does not.
+TOTAL_PAGES = int(os.environ.get("BESTOFN_SMOKE_TOTAL_PAGES", "0"))
+_FILLER = (
+    "The scheduler admits requests in bid order, reserves working pages for the "
+    "prefill batch, then dispatches the forward pass to the driver. "
+)
+
+
+def _history() -> list[dict]:
+    """Synthetic prior turns, then the real prompt as the final user message."""
+    msgs: list[dict] = []
+    for i in range(HISTORY_TURNS):
+        msgs.append({"role": "user", "content": f"Step {i}: summarise. {_FILLER}"})
+        msgs.append({"role": "assistant", "content": f"Acknowledged step {i}. {_FILLER}"})
+    msgs.append({"role": "user", "content": PROMPT})
+    return msgs
 DUP_THRESHOLD = 0.8  # mirrors Rust super::diversity::DUP_THRESHOLD
+
+_PAGES_LINE = f"total_pages = {TOTAL_PAGES}" if TOTAL_PAGES else ""
 
 CONFIG_TOML = f"""
 [server]
@@ -93,6 +121,7 @@ type = "portable"
 device = ["metal"]
 
 [model.driver.options]
+{_PAGES_LINE}
 """
 
 PROMPT = "What's a good way to spend a free Saturday afternoon? Give me one idea."
@@ -225,9 +254,9 @@ def round1_payload() -> dict:
         "inferlet": "best-of-n",
         "stream": True,
         "input": {
-            "messages": [{"role": "user", "content": PROMPT}],
+            "messages": _history(),
             "n": N,
-            "max_tokens_per_candidate": 96,
+            "max_tokens_per_candidate": MAX_TOK_PER_CAND,
             "temperature": 0.8,
             "top_p": 0.95,
         },
@@ -239,9 +268,9 @@ def think_more_payload(*, resume_from: str, picked_text: str, unpicked: list[str
         "inferlet": "best-of-n",
         "stream": True,
         "input": {
-            "messages": [{"role": "user", "content": PROMPT}],
+            "messages": _history(),
             "n": N,
-            "max_tokens_per_candidate": 96,
+            "max_tokens_per_candidate": MAX_TOK_PER_CAND,
             "temperature": 0.8,
             "top_p": 0.95,
             "resume_from": resume_from,

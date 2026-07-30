@@ -444,7 +444,9 @@ async fn run_round(
         let node = match demux.kind {
             DemuxKind::Answered => {
                 let snapshot_name = format!("bon/{request_id}/{}/{}", params.level, idx);
-                let saved = save_candidate_snapshot(&base_ctx, &demux.answer, &snapshot_name).await;
+                let saved =
+                    save_candidate_snapshot(model, &base_ctx, &demux.answer, &snapshot_name)
+                        .await;
                 if saved {
                     kept.push(node_id.clone());
                     picks.push(stream::Pick {
@@ -580,7 +582,30 @@ fn error_node(id: &str, branch_index: usize, level: usize, reasoning: String, er
 /// into a fixed "could not be saved" node that loses the cause, so a SYSTEMIC
 /// snapshot-store problem (e.g. page-store exhaustion) is invisible without
 /// this breadcrumb. The error rides the inferlet stderr-event channel.
-async fn save_candidate_snapshot(base_ctx: &Context, answer: &str, name: &str) -> bool {
+async fn save_candidate_snapshot(
+    model: &Model,
+    base_ctx: &Context,
+    answer: &str,
+    name: &str,
+) -> bool {
+    // Clear any snapshot already parked under this name before saving.
+    //
+    // Candidate names are positional -- `bon/{request_id}/{level}/{idx}` -- not
+    // content hashes, so re-running the SAME request (the app's "Retry from
+    // here" / regenerate) collides on every name. `Context::save` refuses an
+    // existing name, `save_candidate_snapshot` returned false for it, and every
+    // branch became an error node: "candidate KV could not be saved for
+    // resume", then `no_candidates` for the round. First send worked, every
+    // regenerate failed, deterministically.
+    //
+    // Treating already-exists as success would be WRONG here, unlike the
+    // content-addressed `chat::prefix_cache` path: the same name now holds a
+    // DIFFERENT candidate's KV (generation is sampled at temperature), so
+    // resuming from the stale snapshot would silently answer from the previous
+    // round's branch. Deleting first makes the new KV authoritative -- the same
+    // order `ResumeOps::delete_snapshot` and the decoder's context reuse
+    // already follow.
+    let _ = Context::delete(model, name);
     let mut snap = match base_ctx.fork() {
         Ok(c) => c,
         Err(e) => {
