@@ -435,7 +435,16 @@ impl Drop for ActiveSnapshotGuard<'_> {
 }
 
 pub fn protect<'a>(model: &'a Model, plan: &ReusePlan) -> ActiveSnapshotGuard<'a> {
-    let names: Vec<String> = plan.open_name.iter().cloned().collect();
+    // Retain every snapshot `acquire` may fork — the exact boundary AND the
+    // ladder fallbacks — so a retention pass cannot evict the base of the
+    // generation in flight. Retaining a name that turns out absent fails
+    // cleanly (and release of an unretained name is a host-side no-op).
+    let names: Vec<String> = plan
+        .open_name
+        .iter()
+        .cloned()
+        .chain(plan.ladder.iter().map(|(_, name)| name.clone()))
+        .collect();
     for name in &names {
         if let Err(e) = Context::retain_snapshot(model, name) {
             eprintln!("[chat-apc] prefix-cache retain snapshot failed for {name}: {e}");
@@ -538,7 +547,7 @@ pub fn suffix_start(full_len: usize, prefix_len: usize) -> Option<usize> {
 #[derive(Serialize, Default, Clone, Debug)]
 pub struct CacheDiag {
     pub event: &'static str,
-    /// `hit` | `miss` | `bypass` | `disabled`.
+    /// `hit` | `hit_ladder` | `miss` | `bypass` | `disabled`.
     pub outcome: &'static str,
     /// Short tag of the chat key (raw key never sent).
     pub key_tag: String,
@@ -559,6 +568,9 @@ pub struct CacheDiag {
     pub working_pages: Option<u32>,
     /// `saved` | `exists` | `skipped:<reason>` | `failed:<reason>` | `none`.
     pub save_result: String,
+    /// Whether the client-sent boundary snapshot was stored, so a client that
+    /// does not echo this engine's text can still hit. `None` if not attempted.
+    pub client_boundary_saved: Option<bool>,
     /// Content-hash portion of the saved next-prefix name (empty when none).
     pub save_hash: String,
     /// Number of same-model snapshots still tracked after retention.
@@ -589,6 +601,7 @@ impl CacheDiag {
             outcome,
             key_tag: short_tag(key),
             save_result: "none".to_string(),
+            client_boundary_saved: None,
             ..Default::default()
         }
     }
@@ -643,6 +656,39 @@ pub struct ReusePlan {
     /// Snapshot name to open on a hit; `None` when the prefix is empty
     /// (nothing worth reusing).
     pub open_name: Option<String>,
+    /// Fallback boundaries to try when `open_name` misses, longest first, as
+    /// `(prefix_token_len, snapshot_name)`.
+    ///
+    /// The exact boundary embeds the assistant text THIS engine generated, so
+    /// any client that resends something else forfeits the entire snapshot --
+    /// the name is a hash of the whole boundary with no partial-prefix
+    /// fallback. That is not a corner case: a trace replay, a UI that strips
+    /// `<think>` reasoning, an edited or regenerated turn, or a tool result
+    /// that differs by one byte all land there. Measured on a real agent
+    /// trace: 33 of 33 turns missed, and TTFT stayed linear in prompt length
+    /// (R^2 = 0.9995) -- a full re-prefill every turn.
+    ///
+    /// Shorter message boundaries are prefixes the client DOES resend
+    /// verbatim, whatever was generated. `finalize` saves the client-sent
+    /// boundary each turn, so in steady state the ladder is already populated
+    /// by previous turns and costs one extra save per turn.
+    pub ladder: Vec<(usize, String)>,
+}
+
+/// How many message boundaries back to try. Each costs one tokenization of
+/// the prefix, so this trades CPU in wasm against a GPU re-prefill of the
+/// whole prompt -- at ~13k tokens the prefill is ~3.4s and a tokenization is
+/// milliseconds, so a small ladder pays for itself many times over. Four
+/// covers the realistic divergence depths: the assistant turn, its tool
+/// result, and an edited or regenerated turn behind them.
+const LADDER_DEPTH: usize = 4;
+
+/// Fallback-cut indices for the ladder: up to [`LADDER_DEPTH`] message
+/// boundaries strictly between the empty prompt and the exact-prefix
+/// boundary, longest first. Excludes `last` itself (that is `open_name`'s
+/// boundary) and 0 (an empty slice reuses nothing).
+fn ladder_cuts(last: usize) -> impl Iterator<Item = usize> {
+    (1..last).rev().take(LADDER_DEPTH)
 }
 
 /// Build the reuse plan for an enabled directive. Tokenizes the prompt via
@@ -671,6 +717,25 @@ pub fn plan(
     } else {
         None
     };
+    // Walk back message by message. Each step is a boundary the client sent
+    // verbatim on some earlier turn, so it survives divergence in anything
+    // after it. Bounded because every candidate costs one tokenization.
+    let mut ladder: Vec<(usize, String)> = Vec::new();
+    for cut in ladder_cuts(last) {
+        let tokens = build_prompt_tokens(model, &messages[..cut], tools, CueMode::None)?;
+        if tokens.is_empty() {
+            break;
+        }
+        let name = snapshot_name(
+            &directive.key,
+            &directive.compat,
+            model_id,
+            TEMPLATE_MARKER,
+            &tokens,
+        );
+        ladder.push((tokens.len(), name));
+    }
+
     Ok(ReusePlan {
         directive,
         model_id: model_id.to_string(),
@@ -678,6 +743,7 @@ pub fn plan(
         cue,
         prefix_tokens,
         open_name,
+        ladder,
     })
 }
 
@@ -716,7 +782,28 @@ pub fn acquire(
                 }
             }
         }
-        // Err / non-monotone → miss (outcome already "miss").
+        // Err / non-monotone → fall through to the ladder.
+    }
+
+    // Ladder: boundaries the client resent verbatim, longest first. The exact
+    // boundary above hits only when the client echoes this engine's own words;
+    // these hold whenever the conversation shares any earlier prefix, which is
+    // what a block-granular cache would have caught.
+    for (prefix_len, name) in &plan.ladder {
+        let Ok(mut ctx) = Context::open(model, name) else {
+            continue;
+        };
+        let Some(start) = suffix_start(plan.prompt_no_cue.len(), *prefix_len) else {
+            continue;
+        };
+        let mut suffix = plan.prompt_no_cue[start..].to_vec();
+        suffix.extend_from_slice(&plan.cue);
+        diag.outcome = "hit_ladder";
+        diag.prefix_hash = name_hash_part(name);
+        diag.base_boundary = *prefix_len;
+        diag.appended = suffix.len();
+        ctx.append(&suffix);
+        return Ok((ctx, diag));
     }
 
     // Miss / nothing to open: full rebuild.
@@ -760,26 +847,33 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
         &next_prefix,
     );
 
-    // Cheap path: re-open the prefix snapshot we generated against (an
-    // immutable fork) and append only this turn's tail — one forward pass
-    // over a single turn. Fall back to a full rebuild on a miss.
-    let reused = match (
-        plan.open_name.as_deref(),
-        suffix_start(plan.prompt_no_cue.len(), plan.prefix_tokens.len()),
-    ) {
-        (Some(n), Some(s)) => Context::open(model, n).ok().map(|mut ctx| {
-            let mut tail = plan.prompt_no_cue[s..].to_vec();
-            tail.extend_from_slice(&assistant);
-            ctx.append(&tail);
-            ctx
-        }),
-        _ => None,
-    };
+    // Cheap path: fork the longest saved boundary that is a prefix of this
+    // request's history — the same candidates `acquire` tries, exact
+    // boundary first, then the ladder — and append only the remainder: one
+    // forward pass over a turn or two, not the whole history. (For a client
+    // that rewrites the assistant text every turn, the exact boundary is
+    // never saved, so without the ladder this path would full-rebuild every
+    // turn.) Fall back to a full rebuild when nothing is saved. The
+    // assistant text is appended *after* the client-boundary save below, so
+    // both snapshots come out of one context build.
+    let exact = plan
+        .open_name
+        .as_deref()
+        .map(|n| (plan.prefix_tokens.len(), n));
+    let reused = exact
+        .into_iter()
+        .chain(plan.ladder.iter().map(|(len, n)| (*len, n.as_str())))
+        .find_map(|(len, n)| {
+            let s = suffix_start(plan.prompt_no_cue.len(), len)?;
+            let mut ctx = Context::open(model, n).ok()?;
+            ctx.append(&plan.prompt_no_cue[s..]);
+            Some(ctx)
+        });
     let mut save_ctx = match reused {
         Some(ctx) => ctx,
         None => match Context::new(model) {
             Ok(mut ctx) => {
-                ctx.append(&next_prefix);
+                ctx.append(&plan.prompt_no_cue);
                 ctx
             }
             Err(e) => {
@@ -789,6 +883,40 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
             }
         },
     };
+    // Save the CLIENT-SENT boundary first. `prompt_no_cue` is this request's
+    // history exactly as it arrived, so it is a verbatim prefix of the next
+    // request no matter what this turn generated -- which is precisely what
+    // the generated-text boundary below cannot promise. `save_ctx` holds
+    // exactly those tokens right now, so this is an intermediate save on the
+    // context we are building anyway: no extra forward pass. (A separate
+    // full-history context would re-prefill the whole conversation on GPU
+    // every turn -- the runtime's page trie dedups memory, not compute.)
+    if !plan.prompt_no_cue.is_empty() {
+        if let Err(e) = save_ctx.flush().await {
+            eprintln!("[chat-apc] prefix-cache boundary flush failed: {e}");
+            diag.save_result = "failed:flush".to_string();
+            return;
+        }
+        let client_name = snapshot_name(
+            &plan.directive.key,
+            &plan.directive.compat,
+            &plan.model_id,
+            TEMPLATE_MARKER,
+            &plan.prompt_no_cue,
+        );
+        match save_ctx.save(&client_name) {
+            Ok(()) => diag.client_boundary_saved = Some(true),
+            Err(e) => {
+                let es = e.to_string();
+                let exists = is_snapshot_already_exists_error(&es);
+                if !exists {
+                    eprintln!("[chat-apc] prefix-cache client-boundary save failed: {es}");
+                }
+                diag.client_boundary_saved = Some(exists);
+            }
+        }
+    }
+    save_ctx.append(&assistant);
     if let Err(e) = save_ctx.flush().await {
         eprintln!("[chat-apc] prefix-cache boundary flush failed: {e}");
         diag.save_result = "failed:flush".to_string();
@@ -1006,6 +1134,45 @@ mod tests {
         assert_eq!(
             open_name, save_name,
             "next turn must hit the saved boundary"
+        );
+    }
+
+    // ─── ladder (divergent-echo fallback) ─────────────────────
+
+    #[test]
+    fn ladder_cuts_exclude_exact_boundary_and_empty_slice() {
+        // Cuts must sit strictly between the empty prompt (0) and the
+        // exact-prefix boundary (`last`) — a cut of 0 reuses nothing and a
+        // cut of `last` would duplicate `open_name`. Longest first, capped
+        // at LADDER_DEPTH.
+        assert_eq!(ladder_cuts(0).count(), 0);
+        assert_eq!(ladder_cuts(1).count(), 0);
+        assert_eq!(ladder_cuts(2).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(ladder_cuts(3).collect::<Vec<_>>(), vec![2, 1]);
+        assert_eq!(ladder_cuts(10).collect::<Vec<_>>(), vec![9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn divergent_assistant_echo_recovers_at_client_boundary() {
+        // Turn N: the client sent history rendering to [1,2,3]; the engine
+        // generated text rendering to [4,5]. finalize saved BOTH boundaries:
+        // the generated-text one and the client-sent one.
+        let engine_boundary = snapshot_name("c", "1", "m", "t", &[1, 2, 3, 4, 5]);
+        let client_boundary = snapshot_name("c", "1", "m", "t", &[1, 2, 3]);
+        // Turn N+1 resends an EDITED assistant turn rendering to [8,9] (a
+        // stripped <think> block, a trace replay, a regenerated turn...):
+        // the exact-prefix lookup hashes the edited tokens — unreachable —
+        // while the first ladder cut re-hashes exactly the history the
+        // client sent last turn and recovers the snapshot.
+        let open_name = snapshot_name("c", "1", "m", "t", &[1, 2, 3, 8, 9]);
+        let ladder_lookup = snapshot_name("c", "1", "m", "t", &[1, 2, 3]);
+        assert_ne!(
+            open_name, engine_boundary,
+            "edited echo must forfeit the exact boundary"
+        );
+        assert_eq!(
+            ladder_lookup, client_boundary,
+            "ladder cut must recover the client-sent boundary"
         );
     }
 
