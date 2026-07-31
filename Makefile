@@ -102,13 +102,13 @@ build-static: genproject ## Compile/type-check Rational app + helper without bui
 check-vendor-pin: ## Fail-closed guard: Vendor/pie gitlink must be reachable from its .gitmodules tracking branch (catches pin/branch drift)
 	Scripts/check-vendor-pie-pin.sh
 
-ci-pr: lint check-vendor-pin test-ci-v2-static-gate test-lint-gui-only-testing test-assert-gui-tests-executed test-lint-e2e-gui-gating verify-app-icon-assets test-app-icon-assets verify-docs-icons test-docs-icons test-menubar-icon-template test-landing-page build-static test-unit test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
+ci-pr: lint check-vendor-pin test-ci-v2-static-gate test-lint-gui-only-testing test-assert-gui-tests-executed test-lint-e2e-gui-gating verify-app-icon-assets test-app-icon-assets verify-docs-icons test-docs-icons test-menubar-icon-template test-landing-page build-static test-unit test-inferlets test-install-guards test-collect-diagnostics test-sanitizer-canary test-release ## Lightweight local/manual gate: static/lint/provenance + compile/type + deterministic unit/contracts including release scripts
 
 local-pre-merge: ci-pr build-tests test-app-unit test-scenario test-smoke test-e2e-http test-real-pie-driver-contract test-gmake-recipe-canary test-harsh-load-selftest test-matrix-aggregator ## Mandatory local pre-merge parity for runtime/heavy checks kept out of the lightweight manual workflow
 
 local-gui-gate: test-gui-script test-gui ## Mandatory local GUI parity gate for UI changes; requires seated session + Automation/Accessibility TCC
 
-local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-gui-history test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui-first-launch-package test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
+local-e2e-gate: test-e2e-engine test-e2e-models test-e2e-chat test-e2e-tot test-e2e-budget-sweep test-e2e-full test-e2e-cache-real test-e2e-apc-divergence test-e2e-bestofn-regen test-gui-history test-gui-stream-cancel test-gui-chat-retry test-gui-load-default test-gui-first-launch-package test-e2e-package test-helper-respawn test-helper-recovery test-quit-structured ## Operator-gated integration/E2E parity; requires documented models, engine, signing, TCC, or live services
 
 release-gate: local-pre-merge test-curated-hf test-dmg-layout test-package-dmg-staging ## Release readiness gate; additionally run release-preflight with ARTIFACT=<built .app|.dmg> after packaging/notarization
 
