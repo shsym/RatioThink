@@ -111,5 +111,84 @@ class ApcBenchRealTests(unittest.TestCase):
         self.assertTrue(all("/no_think" in content for content in user_turns))
 
 
+def _pair(warm_reused, warm_appended, cold_pages, warm_pages):
+    """A cold/warm pair that differs ONLY in the quantities under test.
+
+    Both turns report the outcomes the existing gate wants (`miss` / `hit`), so
+    anything these tests catch is caught strictly by the cheapness floors.
+    """
+    cold = bench.TurnMeasurement(
+        label="cold_miss", status_code=200, wall_time_s=4.0, ttft_s=1.2, content="cold",
+        cache_diag={"outcome": "miss", "base_boundary": 0, "appended": 400},
+        output_tokens=10, tokens_per_sec=5.0,
+        kv_pages_before=0, kv_pages_after=cold_pages,
+        rss_bytes_before=0, rss_bytes_after=0,
+    )
+    warm = bench.TurnMeasurement(
+        label="warm_hit", status_code=200, wall_time_s=2.5, ttft_s=0.2, content="warm",
+        cache_diag={"outcome": "hit", "base_boundary": warm_reused, "appended": warm_appended},
+        output_tokens=10, tokens_per_sec=5.0,
+        kv_pages_before=0, kv_pages_after=warm_pages,
+        rss_bytes_before=0, rss_bytes_after=0,
+    )
+    return cold, warm
+
+
+class WarmTurnCheapnessTests(unittest.TestCase):
+    """`outcome == "hit"` is a boolean; these floors make it a measurement.
+
+    Both regressions these guard against reported a healthy warm hit while
+    doing the cold turn's work.
+    """
+
+    def test_a_genuinely_cheap_warm_hit_passes(self):
+        failures = []
+        cold, warm = _pair(warm_reused=380, warm_appended=20, cold_pages=40, warm_pages=4)
+        bench._validate_pair("scenario", 0, cold, warm, failures)
+        self.assertEqual(failures, [])
+
+    def test_a_hit_reaching_a_shallow_boundary_fails_the_reuse_floor(self):
+        # Graded loss: still a hit, still >0 reused tokens, but most of the
+        # history is being re-prefilled — the pre-ladder defect's shape.
+        failures = []
+        cold, warm = _pair(warm_reused=100, warm_appended=300, cold_pages=40, warm_pages=4)
+        bench._validate_pair("scenario", 0, cold, warm, failures)
+        self.assertTrue(any("reuse fraction" in f for f in failures), failures)
+
+    def test_a_hit_that_reprefills_fails_the_page_floor(self):
+        # The regression introduced while fixing the first bug: the boundary
+        # save ran on a separate full-history context, so the warm turn paid a
+        # second full forward pass. TTFT was UNCHANGED, which is why every
+        # latency assertion passed and only wall time grew.
+        failures = []
+        cold, warm = _pair(warm_reused=380, warm_appended=20, cold_pages=40, warm_pages=39)
+        bench._validate_pair("scenario", 0, cold, warm, failures)
+        self.assertTrue(any("prefilling like a miss" in f for f in failures), failures)
+
+    def test_the_floors_are_skipped_when_the_engine_reported_no_pages(self):
+        # Absent page accounting must not manufacture a failure.
+        failures = []
+        cold, warm = _pair(warm_reused=380, warm_appended=20, cold_pages=0, warm_pages=0)
+        bench._validate_pair("scenario", 0, cold, warm, failures)
+        self.assertEqual(failures, [])
+
+    def test_a_short_exchange_is_exempt_because_the_new_turn_dominates(self):
+        # Measured `short_qa`: 35 of 59 prompt tokens reused on 3 vs 2 pages.
+        # A perfect warm hit cannot do better — the other 24 tokens ARE the new
+        # user message. Flagging it would only train people to ignore the bench.
+        failures = []
+        cold, warm = _pair(warm_reused=35, warm_appended=24, cold_pages=3, warm_pages=2)
+        bench._validate_pair("scenario", 0, cold, warm, failures)
+        self.assertEqual(failures, [])
+
+    def test_the_measured_healthy_long_scenario_passes(self):
+        # Measured `long_agent_summary`: 1655/1688 reused (0.980), 5 -> 2 pages
+        # (0.40). This is the shape both floors are calibrated to protect.
+        failures = []
+        cold, warm = _pair(warm_reused=1655, warm_appended=33, cold_pages=5, warm_pages=2)
+        bench._validate_pair("scenario", 0, cold, warm, failures)
+        self.assertEqual(failures, [])
+
+
 if __name__ == "__main__":
     unittest.main()

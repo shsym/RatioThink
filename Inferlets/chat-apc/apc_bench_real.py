@@ -650,6 +650,68 @@ def _validate_pair(scenario: str, idx: int, cold: TurnMeasurement, warm: TurnMea
         failures.append(f"{prefix} warm outcome={warm.cache_diag.get('outcome')!r}, want hit")
     elif (warm.cache_diag.get("base_boundary") or 0) <= 0:
         failures.append(f"{prefix} warm hit reused no prefix tokens: {warm.cache_diag!r}")
+    else:
+        _validate_warm_is_cheap(prefix, cold, warm, failures)
+
+
+# A warm turn that reports `outcome=hit` can still be doing the cold turn's
+# work. Both floors below exist because a boolean hit is not a measurement:
+#
+#  * REUSE FRACTION guards graded loss. A naming change that keeps SOME
+#    boundary reachable still reports `hit` while re-prefilling most of the
+#    history — the shape of the defect that cost 25.7x TTFT before the ladder.
+#  * PAGE DELTA guards a hit that re-prefills anyway. A boundary save built on
+#    a SEPARATE full-history context hits the cache and then pays a second
+#    forward pass over the whole conversation; TTFT is unchanged (the reused
+#    prefix still shortcuts the first token) so every latency assertion passes
+#    while wall time silently grows. That regression shipped into review and
+#    was caught by a human reading `flush()`'s contract, which is not a
+#    repeatable process. Page allocation is where it is visible: a real warm
+#    hit must allocate far fewer KV pages than the cold miss it replaced.
+#
+# Both floors are calibrated against measured values and only applied where
+# they mean something. On a toy exchange the NEW user turn — which can never
+# come from cache — dominates the prompt, so a perfect warm hit still scores a
+# low fraction: the measured `short_qa` scenario reuses 35 of 59 tokens (0.59)
+# and that IS its ceiling. Page counts are likewise quantized at page_size, so
+# a 3-vs-2-page comparison is noise, not signal. Applying the floors there
+# would only teach people to ignore a red bench.
+#
+# The realistic scenario is where the defects actually showed: measured
+# `long_agent_summary` reuses 1655 of 1688 tokens (0.980) on 5 cold vs 2 warm
+# pages (0.40). A lost boundary drives the fraction toward 0; a hit that
+# re-prefills drives the page ratio toward 1.0. Both floors sit between.
+MIN_WARM_REUSE_FRACTION = float(os.environ.get("APC_BENCH_MIN_REUSE_FRACTION", "0.80"))
+MAX_WARM_COLD_PAGE_RATIO = float(os.environ.get("APC_BENCH_MAX_PAGE_RATIO", "0.75"))
+# Below these the arithmetic above makes the floors meaningless, not lenient.
+MIN_PROMPT_TOKENS_FOR_REUSE_FLOOR = int(os.environ.get("APC_BENCH_MIN_PROMPT_TOKENS", "256"))
+MIN_COLD_PAGES_FOR_RATIO_FLOOR = int(os.environ.get("APC_BENCH_MIN_COLD_PAGES", "4"))
+
+
+def _validate_warm_is_cheap(prefix: str, cold: TurnMeasurement, warm: TurnMeasurement,
+                            failures: list[str]) -> None:
+    reused = warm.cache_diag.get("base_boundary") or 0
+    appended = warm.cache_diag.get("appended") or 0
+    prompt_tokens = reused + appended
+    if prompt_tokens >= MIN_PROMPT_TOKENS_FOR_REUSE_FLOOR:
+        fraction = reused / prompt_tokens
+        if fraction < MIN_WARM_REUSE_FRACTION:
+            failures.append(
+                f"{prefix} warm reuse fraction {fraction:.3f} < "
+                f"{MIN_WARM_REUSE_FRACTION:.3f} ({reused}/{prompt_tokens} prompt tokens "
+                f"from cache) — the hit is reaching a much shallower boundary than it should"
+            )
+
+    cold_pages = _delta(cold.kv_pages_after, cold.kv_pages_before)
+    warm_pages = _delta(warm.kv_pages_after, warm.kv_pages_before)
+    if cold_pages and cold_pages >= MIN_COLD_PAGES_FOR_RATIO_FLOOR and warm_pages is not None:
+        ratio = warm_pages / cold_pages
+        if ratio > MAX_WARM_COLD_PAGE_RATIO:
+            failures.append(
+                f"{prefix} warm allocated {warm_pages} KV pages vs cold {cold_pages} "
+                f"(ratio {ratio:.2f} > {MAX_WARM_COLD_PAGE_RATIO:.2f}) — the turn reports a "
+                f"cache hit but is prefilling like a miss"
+            )
 
 
 def _aggregate_comparisons(scenario: str, run_pairs: list[dict[str, Any]]) -> dict[str, Any]:
