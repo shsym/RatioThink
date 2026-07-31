@@ -47,6 +47,7 @@ use inferlet::Context;
 use inferlet::model::Model;
 
 use crate::chat::completions::{self, ChatMessage};
+use crate::snapshot_names::{Collision, collision_for};
 use crate::sse::{self, Emitter};
 use crate::tot::branch::{
     self, BranchSink, DemuxKind, Node, NodeStatus, emit_level, emit_tree_start, generate_branch,
@@ -604,7 +605,14 @@ async fn save_candidate_snapshot(
     // round's branch. Deleting first makes the new KV authoritative -- the same
     // order `ResumeOps::delete_snapshot` and the decoder's context reuse
     // already follow.
-    let _ = Context::delete(model, name);
+    //
+    // The policy comes from the namespace registry rather than being hardcoded
+    // here, so a future rename or a new namespace routed through this path
+    // cannot silently inherit the wrong column. An UNREGISTERED name skips the
+    // delete and lets `save` fail loudly -- fail-closed, never silent-wrong KV.
+    if collision_for(name) == Some(Collision::ReplaceBeforeSave) {
+        let _ = Context::delete(model, name);
+    }
     let mut snap = match base_ctx.fork() {
         Ok(c) => c,
         Err(e) => {

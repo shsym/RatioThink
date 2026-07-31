@@ -36,11 +36,6 @@
 mod bestofn;
 mod chat;
 mod control;
-/// Snapshot-name collision semantics + the call-site canary that guards them.
-/// Test-only: it is a regression guard over the naming contract, not runtime
-/// logic. Wiring `collision_for` into the save sites would make it
-/// load-bearing; today the canary is what enforces the contract.
-#[cfg(test)]
 mod snapshot_names;
 mod sse;
 mod tot;

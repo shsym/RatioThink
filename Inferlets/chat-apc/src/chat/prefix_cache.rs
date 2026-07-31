@@ -613,6 +613,7 @@ impl CacheDiag {
 // =============================================================================
 
 use super::completions::{ChatMessage, CueMode, ToolSchema, build_prompt_tokens, generation_cue};
+use crate::snapshot_names::{Collision, collision_for};
 use inferlet::chat;
 use inferlet::model::Model;
 use inferlet::{
@@ -640,6 +641,22 @@ fn name_hash_part(name: &str) -> String {
 /// contain "already exists" are not mislabeled as benign duplicate saves.
 fn is_snapshot_already_exists_error(message: &str) -> bool {
     message.starts_with("Snapshot name already exists:")
+}
+
+/// Whether a failed save that reports "already exists" may be treated as a hit.
+///
+/// Being an already-exists error is NOT sufficient. It is benign only for a
+/// namespace whose names are content-addressed, where an existing snapshot is
+/// the same KV by construction. For a positionally named namespace the parked
+/// KV may be a different generation entirely, so accepting it would answer from
+/// stale state — the failure mode `bestofn` deletes before saving to avoid.
+///
+/// Deriving that from [`collision_for`] rather than hardcoding it here means a
+/// rename, or a positional name routed through this path later, cannot silently
+/// inherit the wrong column: an unregistered namespace is never benign.
+fn existing_snapshot_is_benign(name: &str, message: &str) -> bool {
+    is_snapshot_already_exists_error(message)
+        && collision_for(name) == Some(Collision::AcceptExisting)
 }
 
 /// Everything the request handler needs to open a prefix snapshot, rebuild
@@ -908,7 +925,7 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
             Ok(()) => diag.client_boundary_saved = Some(true),
             Err(e) => {
                 let es = e.to_string();
-                let exists = is_snapshot_already_exists_error(&es);
+                let exists = existing_snapshot_is_benign(&client_name, &es);
                 if !exists {
                     eprintln!("[chat-apc] prefix-cache client-boundary save failed: {es}");
                 }
@@ -934,7 +951,7 @@ pub async fn finalize(plan: &ReusePlan, gen_content: &str, model: &Model, diag: 
         }
         Err(e) => {
             let es = e.to_string();
-            if is_snapshot_already_exists_error(&es) {
+            if existing_snapshot_is_benign(&name, &es) {
                 // Same content hash already saved — identical KV, benign,
                 // still a valid future hit.
                 diag.save_result = "exists".to_string();
@@ -1110,6 +1127,26 @@ mod tests {
         ));
         assert!(!is_snapshot_already_exists_error(
             "context save failed: Snapshot name already exists: apc/chat/1/deadbeef"
+        ));
+    }
+
+    #[test]
+    fn an_existing_snapshot_is_benign_only_for_a_content_addressed_name() {
+        const ERR: &str = "Snapshot name already exists: apc/chat/1/deadbeef";
+        // apc/ names are content hashes: an existing one holds the same KV.
+        assert!(existing_snapshot_is_benign("apc/chat/1/deadbeef", ERR));
+        // bon/ names are positional: the parked KV may be a DIFFERENT sampled
+        // candidate, so "already exists" must never be swallowed as a hit here.
+        assert!(!existing_snapshot_is_benign("bon/req-1/2/0", ERR));
+        // Fail closed on a namespace nobody registered.
+        assert!(!existing_snapshot_is_benign("scratch/x", ERR));
+    }
+
+    #[test]
+    fn a_real_save_failure_is_never_benign_whatever_the_namespace() {
+        assert!(!existing_snapshot_is_benign(
+            "apc/chat/1/deadbeef",
+            "host bridge failed before save: out of pages"
         ));
     }
 
