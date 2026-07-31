@@ -445,8 +445,7 @@ async fn run_round(
             DemuxKind::Answered => {
                 let snapshot_name = format!("bon/{request_id}/{}/{}", params.level, idx);
                 let saved =
-                    save_candidate_snapshot(model, &base_ctx, &demux.answer, &snapshot_name)
-                        .await;
+                    save_candidate_snapshot(model, &base_ctx, &demux.answer, &snapshot_name).await;
                 if saved {
                     kept.push(node_id.clone());
                     picks.push(stream::Pick {
