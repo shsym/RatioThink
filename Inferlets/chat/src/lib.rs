@@ -63,10 +63,10 @@ async fn main(input: RunInput) -> inferlet::Result<String> {
     if input.v != ratio_wire::envelope::ENVELOPE_VERSION {
         return Ok(fail(
             &sink,
-            GenError {
-                code: "unsupported_envelope_version".into(),
-                message: format!("v={} not supported", input.v),
-            },
+            GenError::new(
+                "unsupported_envelope_version",
+                format!("v={} not supported", input.v),
+            ),
         ));
     }
 
@@ -77,7 +77,7 @@ async fn main(input: RunInput) -> inferlet::Result<String> {
         Err(e) => {
             return Ok(fail(
                 &sink,
-                GenError { code: "invalid_request".into(), message: e.to_string() },
+                GenError::new("invalid_request", e.to_string()),
             ));
         }
     };

@@ -1,0 +1,28 @@
+[package]
+name = "tot"
+version = "0.1.0"
+description = "Tree-of-thought beam search over tot-core"
+authors = ["RatioThink"]
+
+[runtime]
+core = "^0.2.0"
+
+# Descriptive only — pie does not enforce these. The real contract is
+# tot_core::schema::TotInput, which `resolve` validates with bounds.
+[parameters]
+model = {type = "string", optional = true, description = "engine-registered model id; defaults to the first served"}
+breadth = {type = "int", optional = true, description = "candidates per level (default 3, max 5)"}
+depth = {type = "int", optional = true, description = "search levels (default 2, max 4)"}
+beam_width = {type = "int", optional = true, description = "survivors per level (default 2, max 5)"}
+
+# Read by ratio-gateway's registry. Unknown to pie, which ignores it.
+[ratio]
+route = "tree-of-thought"
+# The shipped app dispatches `inferlet: "tree-of-thought"`; `tot` is the short
+# name for curl and the dev scripts.
+aliases = ["tot"]
+protocol = "tree-v1"
+# Lazy: a ToT turn is rare next to chat, so it installs on first use rather
+# than costing every boot.
+preload = false
+snapshot_prefixes = ["conv/"]

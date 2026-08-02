@@ -4,9 +4,11 @@
 #   ./Gateway/dev/run.sh build            build gateway + inferlets
 #   ./Gateway/dev/run.sh serve [real|dummy]   run gateway (default: real / Qwen2.5-7B)
 #   ./Gateway/dev/run.sh chat "prompt"    one chat request against a running gateway
+#   ./Gateway/dev/run.sh tot "prompt"     one tree-of-thought request
 #   ./Gateway/dev/run.sh test             all Rust test suites
 #   ./Gateway/dev/run.sh conformance      phase-1 transport gate (needs `serve dummy`)
 #   ./Gateway/dev/run.sh reload-test      B1 gate: hot-reload echo (needs `serve`)
+#   ./Gateway/dev/run.sh crossmode        B2 gate: chat -> ToT -> chat KV reuse
 #   ./Gateway/dev/run.sh ab               A/B vs the chat-apc oracle (needs both up)
 #   ./Gateway/dev/run.sh oracle           start chat-apc on :8081 for the A/B
 set -euo pipefail
@@ -39,12 +41,12 @@ cmd_build() {
   need_cargo
   rustup target list --installed | grep -q wasm32-wasip2 || rustup target add wasm32-wasip2
   echo "==> inferlets → wasm"
-  for i in chat echo; do
+  for i in chat echo tot; do
     ( cd "$REPO/Inferlets/$i" && cargo build --release --target wasm32-wasip2 )
   done
   echo "==> gateway"
   ( cd "$REPO/Gateway" && cargo build --release )
-  stage chat echo
+  stage chat echo tot
   echo "✅ built → $INFERLET_DIR"
 }
 
@@ -166,6 +168,59 @@ for l in sys.stdin:
 "
 }
 
+# One ToT request, printing the raw tree frames. `-N` so the stream is not
+# buffered: the interleaving of sibling node_deltas is the point.
+cmd_tot() {
+  local prompt="${1:-Name one prime number.}"
+  local body
+  body=$(python3 -c "
+import json,sys
+print(json.dumps({'inferlet':'tree-of-thought','input':{
+  'model':'qwen','messages':[{'role':'user','content':sys.argv[1]}],
+  'breadth':2,'depth':1,'beam_width':1,'max_tokens_per_node':96,'thinking':False,
+  'boundary':{'key':'tot-dev-conv','turn':1,'compat':'1'}}}))" "$prompt")
+  curl -sN -m 900 "http://127.0.0.1:$PORT/v1/inferlet" \
+    -H 'content-type: application/json' -d "$body"
+}
+
+# B2 exit gate: chat -> ToT -> chat must reuse KV ACROSS the mode switch.
+# Legacy ToT could not do this at all (tot/ has no Context::save|open and no
+# prefix_cache reference), so this measures a capability that did not exist.
+#
+# Asserts on `reused_tokens`, NOT on `open()` succeeding and NOT on
+# OpenOutcome.exact:
+#   * eviction calls suspend, not delete, so an evicted snapshot still OPENS
+#     and silently replays — success there proves nothing;
+#   * `exact` is unsatisfiable by construction. The exact name covers the new
+#     turn's user message, which nothing has saved yet, so a cross-mode hit is
+#     always a ladder rung at cut = len-1. Demanding `exact` would fail 100% of
+#     the time even when reuse works perfectly.
+cmd_crossmode() {
+  local key="${1:-b2-crossmode-$$}"
+  local log="${GATEWAY_LOG:-/tmp/tot2.log}"
+  local before
+  # TOTAL lines, not matching lines — the offset feeds `tail -n +N`.
+  before=$(wc -l < "$log" 2>/dev/null || echo 0)
+  python3 "$REPO/Gateway/dev/crossmode.py" "$key" || return 1
+  echo
+  echo "==> reuse across the mode switch"
+  # Strip ANSI once, then both display and assertions read the same text — the
+  # tracing output is colourized, so a literal grep on the raw log never matches.
+  local slice
+  slice=$(tail -n +$((before + 1)) "$log" | sed $'s/\033\[[0-9;]*m//g' | grep -E "kv reuse" || true)
+  echo "$slice"
+  # turn 2 (ToT) must have REUSED, and turn 3 (chat) must have reused MORE than
+  # turn 2 did — more means it hit the boundary ToT wrote, not a fallback to
+  # the shallower one chat left in turn 1.
+  local tot_reused chat_reused
+  tot_reused=$(echo "$slice" | grep "tree kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
+  chat_reused=$(echo "$slice" | grep "chat: kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
+  [[ -n "$tot_reused" && "$tot_reused" -gt 0 ]] || { echo "❌ ToT did not reuse chat's boundary (entry half)"; return 1; }
+  [[ -n "$chat_reused" && "$chat_reused" -gt "$tot_reused" ]] || {
+    echo "❌ chat reused ${chat_reused:-none} <= ToT's $tot_reused — it fell back to turn 1's boundary, so ToT's exit save did not land"; return 1; }
+  echo "✅ B2 gate passed: ToT reused $tot_reused (entry), chat then reused $chat_reused (exit)"
+}
+
 cmd_test() {
   need_cargo
   echo "==> ratio-wire (golden + forward-compat)"; ( cd "$REPO/Inferlets/ratio-wire" && cargo test )
@@ -173,7 +228,7 @@ cmd_test() {
   echo "==> ratio-names";                            ( cd "$REPO/Inferlets/ratio-names" && cargo test )
   # Both feature states: the exec-strategies gate changes which `exec` values
   # `resolve` accepts, and only the OFF build is what ships.
-  echo "==> tot-core (tree/diversity/schema)";       ( cd "$REPO/Inferlets/tot-core" && cargo test --lib && cargo test --lib --features exec-strategies )
+  echo "==> tot-core (search/tree/diversity/schema/stream)";       ( cd "$REPO/Inferlets/tot-core" && cargo test --lib && cargo test --lib --features exec-strategies )
   echo "==> gateway";                                ( cd "$REPO/Gateway"             && cargo test )
 }
 
@@ -238,6 +293,8 @@ case "${1:-}" in
   build)       cmd_build ;;
   serve)       cmd_serve "${2:-real}" ;;
   chat)        cmd_chat "${2:-}" ;;
+  tot)         cmd_tot "${2:-}" ;;
+  crossmode)   cmd_crossmode "${2:-}" ;;
   test)        cmd_test ;;
   conformance) cmd_conformance ;;
   reload-test) cmd_reload_test ;;

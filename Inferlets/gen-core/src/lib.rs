@@ -31,15 +31,28 @@ use schema::ChatRequest;
 pub struct GenError {
     pub code: String,
     pub message: String,
+    /// The offending request field, for the OpenAI-shape `param`.
+    ///
+    /// ToT's validators produce these for every bounds rejection — `breadth`,
+    /// `depth`, `top_p`, `exec` — and chat-apc carried them through
+    /// `json_error_param`. Without the field every 400 arrives anonymous and
+    /// the client cannot point at what to fix.
+    pub param: Option<String>,
 }
 
 impl GenError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into() }
+    /// `pub` because tot-core is a separate crate and constructs these.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self { code: code.into(), message: message.into(), param: None }
+    }
+
+    pub fn with_param(mut self, p: impl Into<String>) -> Self {
+        self.param = Some(p.into());
+        self
     }
 
     pub fn into_event(self) -> Event {
-        Event::Error { code: self.code, message: self.message, param: None }
+        Event::Error { code: self.code, message: self.message, param: self.param }
     }
 }
 

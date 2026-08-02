@@ -237,10 +237,45 @@ string in the gateway. `--inferlet-dir` replaces the four wasm/manifest flags;
 `GatewaySupervisor` passes the bundle's staged directory and no admin token, so
 reload is disabled in the shipped app.
 
-**B2 — ToT.** `tot-core` + `tot.wasm`; `BranchSink` → `&dyn EventSink`; the 15
-`sse::json_error` sites → `GenError`; `/no_think` after the fork; `tree-v1`
-protocol class; entry via `open_boundary`, exit per §6.1.
-*Exit: **chat→ToT→chat exact hit**; ToT frames match the golden fixtures.*
+**B2 — ToT.** ✅ **Done.** `tot-core` + `tot.wasm`; `BranchSink` → `&dyn
+EventSink`; `sse::json_error` → `GenError` (which gained `param`, so ToT's
+bounds rejections still name the offending field); `/no_think` after the fork;
+`tree-v1` protocol class; entry via `open_canonical`, exit per §6.1.
+
+*Exit met*, `./Gateway/dev/run.sh crossmode`:
+
+| turn | mode | `boundary_found` | `reused_tokens` | prompt |
+|------|------|------------------|-----------------|--------|
+| 1 | chat (cold) | false | 0  | 13 |
+| 2 | **ToT**     | true  | 22 | —  |
+| 3 | chat        | true  | 44 | 58 |
+
+Turn 2 proves the entry half (ToT opened the boundary chat left); turn 3 proves
+the exit half, and 44 > 22 is what proves it hit ToT's boundary rather than
+falling back to turn 1's. Legacy ToT has no `Context::save|open` at all, so this
+is a capability that did not previously exist.
+
+**The exit criterion was restated.** The plan said "exact hit"; that is
+unsatisfiable by construction. `OpenOutcome.exact` requires a boundary named
+over ALL of the new turn's messages, including its new user message, which
+nothing has saved yet — so a cross-mode hit is always a ladder rung at
+`cut = len-1`. Demanding `exact` would fail 100% of the time even when reuse
+works perfectly, and the predictable repair is to weaken it until it proves
+nothing. The gate asserts on `reused_tokens` instead, and compares the two
+halves against each other.
+
+Live ToT output matches the captured chat-apc stream in structure and content:
+both `node_start`s before any delta, siblings interleaving, `node_scoring` for
+n1 landing between n2's deltas, and a `tree_complete` byte-identical but for the
+now gateway-owned tree id.
+
+*Scope, stated rather than implied:* `TotTask::Chat` and the default
+`coupled_sequential` exec strategy — what chat-apc ships. The `reasoning` task
+mode, `sibling_penalty`, and the feature-gated phased strategies are ported but
+unexercised. Gemma's `<|channel>thought` demux is NOT ported: `gen-core`'s chat
+path already omits it, so both modes now degrade identically on Gemma rather
+than diverging. Cooperative cancellation is not implemented in the guest (nor
+was it in chat-apc); the gateway's terminate bounds it at ~251 ms.
 
 **C — Best-of-N.** `bestofn.wasm` over `tot-core`; digest-named candidates;
 validated resume; the §6.2 commit operation.

@@ -274,6 +274,7 @@ async fn drive(
     route: String,
 ) {
     let pid = proc.id().to_string();
+    let mut terminal_seen = false;
     loop {
         tokio::select! {
             _ = &mut cancel_rx => {
@@ -316,9 +317,18 @@ async fn drive(
                         // A guest error post-commit IS the terminal (F1): it
                         // replaces tree_complete rather than preceding it, so
                         // a failed search never renders as a blank success.
+                        //
+                        // Do NOT break here. The terminal EVENT is not the end
+                        // of the exchange — the process still returns, and the
+                        // return value carries the reuse diagnostics. Breaking
+                        // on the event drops them silently, which makes a ToT
+                        // path that cold-starts every turn indistinguishable
+                        // from one that reuses. The guest completes both
+                        // boundary saves BEFORE its terminal event (§6.1), so
+                        // waiting for the return costs nothing.
                         if let Ok(Some(ev)) = decoded {
                             if is_terminal(&ev) || matches!(ev, Event::Error { .. }) {
-                                break;
+                                terminal_seen = true;
                             }
                         }
                     }
@@ -327,6 +337,16 @@ async fn drive(
                     // otherwise unobservable — without them a ToT path that
                     // cold-starts every turn looks identical to one that reuses.
                     Ok(ProcessEvent::Return(r)) => {
+                        if !terminal_seen {
+                            // The guest returned without a terminal event, so
+                            // the stream would otherwise end on a bare [DONE]
+                            // that reads as success.
+                            let _ = tx.send(Frame::Fault(
+                                "no_terminal".into(),
+                                "tree inferlet returned without a terminal event".into(),
+                            )).await;
+                            return;
+                        }
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&r) {
                             tracing::info!(
                                 %route,
