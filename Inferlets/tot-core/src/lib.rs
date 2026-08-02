@@ -31,4 +31,5 @@
 
 pub mod diversity;
 pub mod schema;
+pub mod stream;
 pub mod tree;

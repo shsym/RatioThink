@@ -86,6 +86,42 @@ impl AppState {
         Ok(())
     }
 
+    /// Model ids the engine is serving, sorted. `--model` short-circuits it.
+    ///
+    /// `runtime::models()` is a WIT import available only inside wasm, so the
+    /// host reads the list from `query("model_status")`, whose keys are
+    /// `"<model>.kv_pages_total"` (handler.rs:53-66).
+    pub async fn models(&self) -> Vec<String> {
+        if let Some(m) = &self.model_override {
+            return vec![m.clone()];
+        }
+        let Ok(c) = self.engine.control_client().await else { return vec![] };
+        let Ok(raw) = c.query("model_status", "{}".to_string()).await else { return vec![] };
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .map(|o| {
+                let mut v: Vec<String> = o
+                    .keys()
+                    .filter_map(|k| k.strip_suffix(".kv_pages_total").map(str::to_string))
+                    .collect();
+                v.sort();
+                v.dedup();
+                v
+            })
+            .unwrap_or_default()
+    }
+
+    /// The engine's first model, for a request that omitted one.
+    ///
+    /// chat-apc resolved an omitted ToT model this way (`tot/mod.rs:254-277`)
+    /// and emitted the RESOLVED id in `tree_start`. Without this the gateway
+    /// would render `"model":""` into the client's tree header — no error, just
+    /// a blank.
+    pub async fn first_model(&self) -> Option<String> {
+        self.models().await.into_iter().next()
+    }
+
     /// Resolve, check the protocol is one the gateway can actually drive, and
     /// make sure the engine has the bytes. The common prologue of every
     /// generative endpoint.
@@ -137,32 +173,7 @@ async fn healthz() -> impl IntoResponse {
 /// are `"<model>.kv_pages_total"` (handler.rs:53-66). `--model` overrides if
 /// pie ever renames those keys.
 async fn models(State(st): State<Arc<AppState>>) -> Response {
-    let ids: Vec<String> = if let Some(m) = &st.model_override {
-        vec![m.clone()]
-    } else {
-        match st.engine.control_client().await {
-            Ok(c) => match c.query("model_status", "{}".to_string()).await {
-                Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-                    .ok()
-                    .and_then(|v| v.as_object().cloned())
-                    .map(|o| {
-                        let mut v: Vec<String> = o
-                            .keys()
-                            .filter_map(|k| k.strip_suffix(".kv_pages_total").map(str::to_string))
-                            .collect();
-                        v.sort();
-                        v.dedup();
-                        v
-                    })
-                    .unwrap_or_default(),
-                Err(_) => vec![],
-            },
-            Err(e) => {
-                return api_error(
-                    StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", &e.to_string());
-            }
-        }
-    };
+    let ids = st.models().await;
     Json(json!({
         "object": "list",
         "data": ids.iter().map(|id| json!({
@@ -287,19 +298,42 @@ async fn inferlet_dispatch(State(st): State<Arc<AppState>>, body: axum::body::By
             "POST /v1/inferlet requires an \"inferlet\" field",
         );
     }
-    match st.prepare(&name).await {
-        // Resolvable and drivable, but this endpoint's own request shape is not
-        // ported. B2/C replace this arm with the tree-v1 driver.
-        Ok(e) => api_error(
+    let entry = match st.prepare(&name).await {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+
+    // Dispatch by PROTOCOL CLASS, not by inferlet name. This is what makes a
+    // new tree-shaped inferlet a manifest entry rather than a gateway change:
+    // `tot` and `bestofn` both declare `tree-v1` and both land in one driver.
+    match entry.protocol {
+        crate::registry::Protocol::TreeV1 => {
+            let raw = match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return api_error(StatusCode::BAD_REQUEST, "invalid_request", &e.to_string());
+                }
+            };
+            crate::tree::dispatch(st, entry.route.clone(), entry.program.clone(), raw).await
+        }
+        // Chat has its own endpoint and its own request shape; routing it here
+        // would duplicate the OpenAI body handling for no gain.
+        crate::registry::Protocol::ChatV1 => api_error(
             StatusCode::NOT_IMPLEMENTED,
             "dispatch_not_implemented",
             &format!(
-                "/v1/inferlet cannot yet drive {:?} ({}); use POST /v1/chat/completions",
-                e.route,
-                e.protocol.as_str()
+                "{:?} speaks chat-v1; use POST /v1/chat/completions",
+                entry.route
             ),
         ),
-        Err(resp) => resp,
+        // `prepare` already rejects protocols with no driver, so this is
+        // unreachable — but stating it keeps the match exhaustive by class
+        // rather than by a catch-all that would silently absorb a new one.
+        crate::registry::Protocol::JsonUnaryV1 => api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "protocol_not_implemented",
+            "json-unary-v1 has no driver",
+        ),
     }
 }
 

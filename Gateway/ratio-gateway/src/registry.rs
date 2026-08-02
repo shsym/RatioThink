@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 pub enum Protocol {
     /// Ready → deltas → finish. Implemented.
     ChatV1,
-    /// tree_start → node_* → tree_complete | awaiting_selection. Milestone B2.
+    /// tree_start → node_* → tree_complete | awaiting_selection. Implemented.
     TreeV1,
     /// No stream; the return value is the whole response.
     JsonUnaryV1,
@@ -59,8 +59,12 @@ impl Protocol {
     }
 
     /// Whether the gateway can actually drive this today.
+    ///
+    /// `JsonUnaryV1` parses but has no driver, so a manifest declaring it gets
+    /// a 501 naming the protocol rather than hanging until
+    /// `first_event_timeout` — which is what a missing commit event costs.
     pub fn implemented(self) -> bool {
-        matches!(self, Self::ChatV1)
+        matches!(self, Self::ChatV1 | Self::TreeV1)
     }
 }
 
@@ -463,9 +467,12 @@ preload = true
     }
 
     #[test]
-    fn tree_v1_parses_but_is_not_yet_implemented() {
+    fn drivable_protocols_are_exactly_the_ones_with_drivers() {
         assert!(Protocol::parse("tree-v1").unwrap() == Protocol::TreeV1);
-        assert!(!Protocol::TreeV1.implemented());
-        assert!(Protocol::ChatV1.implemented());
+        assert!(Protocol::ChatV1.implemented(), "chat.rs");
+        assert!(Protocol::TreeV1.implemented(), "tree.rs");
+        // No driver: must 501 naming the protocol, not hang until the
+        // first-event timeout waiting for a commit event that never comes.
+        assert!(!Protocol::JsonUnaryV1.implemented());
     }
 }

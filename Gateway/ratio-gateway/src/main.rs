@@ -7,6 +7,7 @@ mod chat;
 mod engine;
 mod registry;
 mod routes;
+mod tree;
 
 use anyhow::{Result, bail};
 use clap::Parser;

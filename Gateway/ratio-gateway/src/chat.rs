@@ -20,7 +20,7 @@ use tokio::time::{Duration, Instant, timeout};
 
 /// The guest reports semantics; the gateway alone decides HTTP status
 /// (doc §5.1). Keep this exhaustive over the codes `gen-core` can emit.
-fn status_for(code: &str) -> StatusCode {
+pub fn status_for(code: &str) -> StatusCode {
     match code {
         "server_busy" => StatusCode::SERVICE_UNAVAILABLE,
         "model_not_found" => StatusCode::NOT_FOUND,
@@ -32,7 +32,7 @@ fn status_for(code: &str) -> StatusCode {
     }
 }
 
-fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
+pub fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     let kind = match status.as_u16() {
         400 => "invalid_request_error",
         404 => "not_found_error",
