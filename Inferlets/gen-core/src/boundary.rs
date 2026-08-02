@@ -204,9 +204,9 @@ pub async fn save_boundary(
     model_id: &str,
     directive: &BoundaryDirective,
     answer: &str,
-) -> Result<(), GenError> {
+) -> Result<SaveOutcome, GenError> {
     if !directive.enabled || directive.key.is_empty() {
-        return Ok(());
+        return Ok(SaveOutcome::disabled());
     }
 
     let mut snap = canonical
@@ -220,7 +220,7 @@ pub async fn save_boundary(
     snap.flush()
         .await
         .map_err(|e| GenError::new("boundary_flush_failed", e))?;
-    save_one(
+    let prompt_saved = save_one(
         &snap,
         &SnapshotName::conv(&directive.key, &directive.compat, model_id, &canonical.tokens),
     );
@@ -234,23 +234,63 @@ pub async fn save_boundary(
     snap.flush()
         .await
         .map_err(|e| GenError::new("boundary_flush_failed", e))?;
-    save_one(
+    let full_saved = save_one(
         &snap,
         &SnapshotName::conv(&directive.key, &directive.compat, model_id, &full),
     );
-    Ok(())
+    Ok(SaveOutcome { prompt_saved, full_saved })
 }
 
 /// Content-addressed names make "already exists" success by construction: the
 /// same name can only have been produced by the same tokens.
-fn save_one(ctx: &Context, name: &SnapshotName) {
-    if let Err(e) = ctx.save(name.as_str()) {
-        let msg = e.to_string();
-        if !msg.contains("already exists") {
-            // Non-fatal: a failed boundary save costs the next turn a
-            // re-prefill, it does not corrupt this one.
+///
+/// Returns whether the name is now present. Callers that treat the save as an
+/// optimization ignore it; callers that are about to do something IRREVERSIBLE
+/// on the strength of it must not.
+fn save_one(ctx: &Context, name: &SnapshotName) -> bool {
+    match ctx.save(name.as_str()) {
+        Ok(()) => true,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already exists") {
+                return true;
+            }
+            // Non-fatal for chat/ToT: a failed boundary save costs the next
+            // turn a re-prefill, it does not corrupt this one.
             eprintln!("[gen-core] boundary save failed for {}: {msg}", name.as_str());
+            false
         }
+    }
+}
+
+/// Which of the two boundaries actually landed.
+///
+/// This type exists because `save_boundary`'s `Result` is NOT a report of
+/// whether anything was written. It returns `Err` only for fork/flush faults;
+/// every `ctx.save` error is swallowed by `save_one`, and the whole function
+/// short-circuits to `Ok(())` when reuse is disabled or the key is empty. So
+/// `save_boundary(...).await?` succeeding is consistent with zero names having
+/// been written.
+///
+/// For chat and ToT that is the right shape — the save is a cache optimization
+/// and a failure costs only a re-prefill. Best-of-N's commit is different: it
+/// DELETES the round's candidate snapshots on the strength of the save, and
+/// those snapshots are the only recovery state. Gating that on a `Result` that
+/// cannot report failure would free the KV after writing nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SaveOutcome {
+    /// The prompt-only boundary (this turn's history, no answer).
+    pub prompt_saved: bool,
+    /// The generated boundary — history + assistant(answer). THIS is the one
+    /// the next turn's ladder hits, so it is what an irreversible follow-up
+    /// action must gate on.
+    pub full_saved: bool,
+}
+
+impl SaveOutcome {
+    /// Nothing was attempted: reuse is off, or the directive carries no key.
+    pub fn disabled() -> Self {
+        Self::default()
     }
 }
 

@@ -9,6 +9,7 @@
 #   ./Gateway/dev/run.sh conformance      phase-1 transport gate (needs `serve dummy`)
 #   ./Gateway/dev/run.sh reload-test      B1 gate: hot-reload echo (needs `serve`)
 #   ./Gateway/dev/run.sh crossmode        B2 gate: chat -> ToT -> chat KV reuse
+#   ./Gateway/dev/run.sh bon              C gate: chat -> BoN -> pick -> commit -> chat
 #   ./Gateway/dev/run.sh ab               A/B vs the chat-apc oracle (needs both up)
 #   ./Gateway/dev/run.sh oracle           start chat-apc on :8081 for the A/B
 set -euo pipefail
@@ -41,12 +42,12 @@ cmd_build() {
   need_cargo
   rustup target list --installed | grep -q wasm32-wasip2 || rustup target add wasm32-wasip2
   echo "==> inferlets → wasm"
-  for i in chat echo tot; do
+  for i in chat echo tot bestofn; do
     ( cd "$REPO/Inferlets/$i" && cargo build --release --target wasm32-wasip2 )
   done
   echo "==> gateway"
   ( cd "$REPO/Gateway" && cargo build --release )
-  stage chat echo tot
+  stage chat echo tot bestofn
   echo "✅ built → $INFERLET_DIR"
 }
 
@@ -221,6 +222,31 @@ cmd_crossmode() {
   echo "✅ B2 gate passed: ToT reused $tot_reused (entry), chat then reused $chat_reused (exit)"
 }
 
+# C exit gate: a full Best-of-N lifecycle, ending in KV reuse across the mode
+# switch. Also exercises the destructive path's guards, which are the only
+# reason this milestone is riskier than the others.
+cmd_bon() {
+  local key="${1:-c-gate-$$}"
+  local log="${GATEWAY_LOG:-/tmp/bon2.log}"
+  local before
+  before=$(wc -l < "$log" 2>/dev/null || echo 0)
+  python3 "$REPO/Gateway/dev/bon.py" "$key" || return 1
+  echo
+  echo "==> reuse across the mode switch"
+  local slice bon_reused chat_reused
+  slice=$(tail -n +$((before + 1)) "$log" | sed $'s/\033\[[0-9;]*m//g' | grep -E "kv reuse" || true)
+  echo "$slice"
+  # Round 1 must have entered on chat's boundary, and the chat turn after the
+  # commit must have reused MORE than that — more means it hit the boundary the
+  # COMMIT wrote, not a fallback to the one chat left before the round.
+  bon_reused=$(echo "$slice" | grep "route=best-of-n" | head -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
+  chat_reused=$(echo "$slice" | grep "chat: kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
+  [[ -n "$bon_reused" && "$bon_reused" -gt 0 ]] || { echo "❌ round 1 did not reuse chat's boundary (entry half)"; return 1; }
+  [[ -n "$chat_reused" && "$chat_reused" -gt "$bon_reused" ]] || {
+    echo "❌ chat reused ${chat_reused:-none} <= round 1's $bon_reused — it fell back to the pre-round boundary, so the commit's save did not land"; return 1; }
+  echo "✅ C gate passed: round 1 reused $bon_reused (entry), chat after commit reused $chat_reused (exit)"
+}
+
 cmd_test() {
   need_cargo
   echo "==> ratio-wire (golden + forward-compat)"; ( cd "$REPO/Inferlets/ratio-wire" && cargo test )
@@ -229,6 +255,7 @@ cmd_test() {
   # Both feature states: the exec-strategies gate changes which `exec` values
   # `resolve` accepts, and only the OFF build is what ships.
   echo "==> tot-core (search/tree/diversity/schema/stream)";       ( cd "$REPO/Inferlets/tot-core" && cargo test --lib && cargo test --lib --features exec-strategies )
+  echo "==> bestofn-core (round/resume/commit/release)"; ( cd "$REPO/Inferlets/bestofn-core" && cargo test --lib )
   echo "==> gateway";                                ( cd "$REPO/Gateway"             && cargo test )
 }
 
@@ -295,6 +322,7 @@ case "${1:-}" in
   chat)        cmd_chat "${2:-}" ;;
   tot)         cmd_tot "${2:-}" ;;
   crossmode)   cmd_crossmode "${2:-}" ;;
+  bon)         cmd_bon "${2:-}" ;;
   test)        cmd_test ;;
   conformance) cmd_conformance ;;
   reload-test) cmd_reload_test ;;

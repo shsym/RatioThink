@@ -1,0 +1,26 @@
+[package]
+name = "bestofn"
+version = "0.1.0"
+description = "Best-of-N candidate rounds with validated resume and commit"
+authors = ["RatioThink"]
+
+[runtime]
+core = "^0.2.0"
+
+# Descriptive only — pie does not enforce these. The real contract is
+# bestofn_core::schema::BestOfNInput.
+[parameters]
+model = {type = "string", optional = true, description = "engine-registered model id"}
+round_id = {type = "string", description = "authorization scope for this round's snapshots"}
+n = {type = "int", optional = true, description = "candidates per round (default 5, max 5)"}
+
+# Read by ratio-gateway's registry. Unknown to pie, which ignores it.
+[ratio]
+route = "best-of-n"
+aliases = ["bestofn", "bon"]
+protocol = "tree-v1"
+preload = false
+# `bon/` is this inferlet's own candidate scratch; `conv/` is written only at
+# commit. Declarative — pie authorizes by (username, name) with no program in
+# the key, so the real guard is ratio_names::may_delete.
+snapshot_prefixes = ["bon/", "conv/"]

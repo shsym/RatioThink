@@ -266,10 +266,14 @@ struct ChatListView: View {
     // them first (best-effort; model resolved engine-side). Collected before
     // `forget`/`delete` mutate the graph; the fire-and-forget release task is
     // independent of this chat's controller, so dropping it next is safe.
-    sendCoordinator.controller(for: chat.id).releaseBestOfNSnapshots(
-      engine: engineStore.client,
-      modelID: nil,
-      snapshotNames: BestOfNRound.uncommittedCandidateSnapshotNames(in: chat.messages))
+    // One request per round — a release carries one authorization scope.
+    for round in BestOfNRound.uncommittedRounds(in: chat.messages) {
+      sendCoordinator.controller(for: chat.id).releaseBestOfNSnapshots(
+        engine: engineStore.client,
+        modelID: nil,
+        roundID: round.roundID,
+        snapshotNames: round.names)
+    }
     // #507: stop any in-flight stream FIRST and drop its controller — the
     // stream writer must never write onto a Message row the cascade is
     // about to delete.

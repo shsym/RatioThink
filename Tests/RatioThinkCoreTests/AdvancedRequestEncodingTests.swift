@@ -63,6 +63,7 @@ final class AdvancedRequestEncodingTests: XCTestCase {
       BestOfNRequestInput(
         model: "qwen",
         boundary: directive,
+        roundID: "ROUND-1",
         messages: [ChatMessage(role: .user, content: "hi")],
         n: 3,
         maxTokensPerCandidate: 256,
@@ -83,6 +84,9 @@ final class AdvancedRequestEncodingTests: XCTestCase {
     XCTAssertEqual(boundary["key"] as? String, directive.key)
     XCTAssertNotNil(json["max_tokens_per_candidate"], "max_tokens_per_candidate missing")
     XCTAssertNotNil(json["top_p"], "top_p missing")
+    // The authorization scope. Without it the guest refuses to mint snapshots,
+    // so a round that omits it cannot be resumed, released or committed.
+    XCTAssertEqual(json["round_id"] as? String, "ROUND-1")
   }
 
   /// Round 1 leaves the resume fields nil and the server reads their absence as
@@ -92,6 +96,7 @@ final class AdvancedRequestEncodingTests: XCTestCase {
       BestOfNRequestInput(
         model: "qwen",
         boundary: directive,
+        roundID: "ROUND-1",
         messages: [],
         n: 3,
         maxTokensPerCandidate: 256,

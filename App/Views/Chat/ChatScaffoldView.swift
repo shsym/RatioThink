@@ -1049,7 +1049,7 @@ struct ChatScaffoldView: View {
         let snapshots = round.candidates.map(\.snapshotName)
         Self.performBestOfNStop(
           text: text, on: message, save: saveContext, report: reportSave,
-          releaseSnapshots: { self.releaseBestOfNSnapshots(snapshots, in: chat) })
+          releaseSnapshots: { self.releaseBestOfNSnapshots(snapshots, roundID: round.roundID, in: chat) })
         bestOfNCommentDrafts[messageID] = nil
       } else {
         try? modelContext.save()
@@ -1159,10 +1159,12 @@ struct ChatScaffoldView: View {
 
   /// Best-effort release of a set of Best-of-N candidate KV snapshots (#690
   /// terminal cleanup). No-op when the engine is not ready or the set is empty.
-  private func releaseBestOfNSnapshots(_ names: [String], in chat: Chat) {
+  private func releaseBestOfNSnapshots(
+    _ names: [String], roundID: String?, in chat: Chat
+  ) {
     guard !names.isEmpty, case .ready(let modelID) = sendGateDecision(for: chat) else { return }
     sendCoordinator.controller(for: chatID).releaseBestOfNSnapshots(
-      engine: engineStore.client, modelID: modelID, snapshotNames: names)
+      engine: engineStore.client, modelID: modelID, roundID: roundID, snapshotNames: names)
   }
 
   /// Abandon cleanup (#690): when the user starts a NEW turn instead of
@@ -1172,8 +1174,11 @@ struct ChatScaffoldView: View {
   /// content but carries a decoded pick set; releasing already-freed names is a harmless
   /// no-op (the server reports them absent), so this is safe to run each turn.
   private func releaseAbandonedBestOfNRounds(in chat: Chat) {
-    let names = BestOfNRound.uncommittedCandidateSnapshotNames(in: chat.messages)
-    releaseBestOfNSnapshots(names, in: chat)
+    // One request PER ROUND: a release is authorized against a single
+    // `round_id`, so a flat list spanning rounds would have most of it refused.
+    for round in BestOfNRound.uncommittedRounds(in: chat.messages) {
+      releaseBestOfNSnapshots(round.names, roundID: round.roundID, in: chat)
+    }
   }
 
   /// Send Best-of-N round 2 expanding from the user's level-1 pick and

@@ -27,6 +27,10 @@ pub fn status_for(code: &str) -> StatusCode {
         "invalid_request"
         | "unsupported_role"
         | "tool_role_unsupported"
+        // An authorization refusal on a snapshot the client does not own is a
+        // CLIENT fault. Falling through to 500 would read as a server bug and
+        // send people debugging the guest instead of their request.
+        | "snapshot_not_in_round"
         | "unsupported_envelope_version" => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }

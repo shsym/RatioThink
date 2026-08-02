@@ -20,13 +20,23 @@ public struct BestOfNRound: Equatable, Sendable, Codable {
   /// first round (no preceding guidance). Optional ⇒ existing persisted rounds
   /// decode with `inboundComment == nil`.
   public var inboundComment: String?
+  /// The engine-minted round identity (`tree_start.id`).
+  ///
+  /// This is the AUTHORIZATION SCOPE for every snapshot this round minted: the
+  /// guest refuses to delete or resume a name whose round tag does not match,
+  /// so a release or commit without it cannot free anything. Optional ⇒ rounds
+  /// persisted before this existed decode with `roundID == nil`, and their
+  /// snapshots are unreleasable — they carry no scope and the only available
+  /// fallback would authorize every round of every chat. They age out.
+  public var roundID: String?
 
   public init(level: Int, candidates: [ToTSelectionCandidate], chosenID: String? = nil,
-              inboundComment: String? = nil) {
+              inboundComment: String? = nil, roundID: String? = nil) {
     self.level = level
     self.candidates = candidates
     self.chosenID = chosenID
     self.inboundComment = inboundComment
+    self.roundID = roundID
   }
 
   /// The chosen candidate, if the user has picked one.
@@ -66,12 +76,29 @@ public struct BestOfNRound: Equatable, Sendable, Codable {
   /// (abandon, profile swap, chat delete) must release so they don't orphan on
   /// the engine. The single source of the "what to release" predicate (#690).
   public static func uncommittedCandidateSnapshotNames(in messages: [Message]) -> [String] {
-    messages.flatMap { message -> [String] in
+    uncommittedRounds(in: messages).flatMap(\.names)
+  }
+
+  /// Uncommitted rounds grouped BY ROUND, each with its authorization scope.
+  ///
+  /// A flat name list cannot be released: the guest authorizes deletes against
+  /// one `round_id`, so a request spanning several rounds would have every name
+  /// from every other round refused. The sweep therefore issues one release per
+  /// round.
+  ///
+  /// Rounds persisted before `roundID` existed are omitted — they carry no
+  /// scope, and the only fallback that would accept them is `bon/bon-0/…`,
+  /// which is every round of every chat. Those snapshots leak once and age out;
+  /// authorizing a mass delete to avoid that would be worse.
+  public static func uncommittedRounds(in messages: [Message]) -> [(roundID: String, names: [String])] {
+    messages.compactMap { message -> (String, [String])? in
       guard message.content.isEmpty,
             let data = message.bestOfN,
-            let round = try? JSONDecoder().decode(BestOfNRound.self, from: data)
-      else { return [] }
-      return round.candidates.map(\.snapshotName)
+            let round = try? JSONDecoder().decode(BestOfNRound.self, from: data),
+            let roundID = round.roundID, !roundID.isEmpty,
+            !round.candidates.isEmpty
+      else { return nil }
+      return (roundID, round.candidates.map(\.snapshotName))
     }
   }
 }

@@ -65,6 +65,26 @@ fn is_terminal(ev: &Event) -> bool {
     matches!(ev, Event::TreeComplete { .. } | Event::AwaitingSelection { .. })
 }
 
+/// Whether this tree-v1 request is a CONTROL op rather than a generative one.
+///
+/// Best-of-N's commit and release run no generation and emit no events: they
+/// return an accounting JSON body. Opening an SSE stream for them would hang
+/// until `first_event_timeout` and then 504, because the deferred-commit loop
+/// waits for an event that is never coming — the same failure mode as pointing
+/// the chat driver at a tree inferlet.
+///
+/// Keyed on the BODY, not on a second protocol class. A class is per registry
+/// Entry, and `bestofn` needs both shapes; splitting it would mean two wasm
+/// artifacts writing the same `bon/` namespace, which is worse.
+fn is_control_op(raw: &serde_json::Value) -> bool {
+    let body = raw.get("input").unwrap_or(raw);
+    body.get("commit").is_some_and(|c| !c.is_null())
+        || body
+            .get("release")
+            .and_then(|r| r.as_array())
+            .is_some_and(|r| !r.is_empty())
+}
+
 /// `POST /v1/inferlet` for a `tree-v1` route.
 pub async fn dispatch(
     st: Arc<AppState>,
@@ -85,6 +105,8 @@ pub async fn dispatch(
     // empty string. NOTE this string is display-only — the model the guest
     // digests into the `conv/` boundary name is the one IT resolves, and the
     // returned `TreeResult.model` is what a test should compare.
+    let control = is_control_op(&raw);
+
     let requested = raw
         .get("input")
         .and_then(|i| i.get("model"))
@@ -121,6 +143,10 @@ pub async fn dispatch(
         Ok(p) => p,
         Err(e) => return api_error(StatusCode::BAD_GATEWAY, "launch_failed", &e.to_string()),
     };
+
+    if control {
+        return unary_response(client, proc, seq_start(), st.first_event_timeout).await;
+    }
 
     // ---- deferred commit ----
     //
@@ -455,5 +481,110 @@ mod tests {
             assert!(!f.contains("finish_reason"), "finish_reason leaked: {f}");
         }
         assert!(frames[2].contains(r#""tokens_per_sec":20.188725285456343"#), "got {}", frames[2]);
+    }
+}
+
+
+fn seq_start() -> SeqChecker {
+    SeqChecker::default()
+}
+
+/// Drive a control op to its return value.
+///
+/// No commit membrane and no stream: the whole exchange is one request and one
+/// JSON body, so a guest error is a real HTTP status all the way through rather
+/// than an in-band frame after a 200.
+async fn unary_response(
+    client: Arc<Client>,
+    mut proc: Process,
+    mut seq: SeqChecker,
+    first_event_timeout: Duration,
+) -> Response {
+    loop {
+        match timeout(first_event_timeout, proc.recv()).await {
+            Err(_) => {
+                let _ = client.terminate_process(proc.id()).await;
+                return api_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "inferlet_timeout",
+                    "control op did not return",
+                );
+            }
+            Ok(Err(e)) => {
+                return api_error(StatusCode::BAD_GATEWAY, "engine_stream_closed", &e.to_string());
+            }
+            Ok(Ok(ProcessEvent::Error(e))) => {
+                return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
+            }
+            Ok(Ok(ProcessEvent::Message(m))) => {
+                // A control op emits at most one event, and only to report a
+                // failure. `param` is carried through: these ops reject with
+                // `param: "round_id"` / `"commit.snapshot_name"`, and losing it
+                // makes an authorization refusal indistinguishable from a
+                // generic 400.
+                if let Ok(env) = seq.accept(&m) {
+                    if let Ok(Some(Event::Error { code, message, param })) = env.decode_event() {
+                        let _ = client.terminate_process(proc.id()).await;
+                        return api_error_param(
+                            status_for(&code),
+                            &code,
+                            &message,
+                            param.as_deref(),
+                        );
+                    }
+                }
+            }
+            Ok(Ok(ProcessEvent::Return(r))) => {
+                let body: serde_json::Value =
+                    serde_json::from_str(&r).unwrap_or(serde_json::Value::Null);
+                if body.is_null() || body.as_object().is_some_and(|o| o.is_empty()) {
+                    // `{}` is what the guest returns after emitting a GenError.
+                    // Reaching here means the error frame was lost, so fail
+                    // rather than acking an operation that may not have run.
+                    return api_error(
+                        StatusCode::BAD_GATEWAY,
+                        "no_output",
+                        "control op returned no accounting",
+                    );
+                }
+                tracing::info!(ack = %r, "best-of-n control op");
+                return axum::Json(body).into_response();
+            }
+            Ok(Ok(ProcessEvent::Stderr(line))) => {
+                tracing::debug!("guest: {}", line.trim_end());
+            }
+            Ok(Ok(_)) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::is_control_op;
+    use serde_json::json;
+
+    #[test]
+    fn a_commit_is_a_control_op() {
+        assert!(is_control_op(&json!({"input": {"commit": {"answer": "x"}}})));
+        assert!(is_control_op(&json!({"commit": {"answer": "x"}})));
+    }
+
+    #[test]
+    fn a_non_empty_release_is_a_control_op() {
+        assert!(is_control_op(&json!({"input": {"release": ["bon/a/1/0/b"]}})));
+    }
+
+    /// An EMPTY release list is not a control op — it would delete nothing and
+    /// must not suppress a generative round that happens to carry the field.
+    #[test]
+    fn an_empty_release_is_not_a_control_op() {
+        assert!(!is_control_op(&json!({"input": {"release": []}})));
+        assert!(!is_control_op(&json!({"input": {"release": null}})));
+    }
+
+    #[test]
+    fn a_generative_round_is_not_a_control_op() {
+        assert!(!is_control_op(&json!({"input": {"n": 5, "messages": []}})));
+        assert!(!is_control_op(&json!({"input": {"commit": null}})));
     }
 }

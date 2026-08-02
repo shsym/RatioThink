@@ -1047,7 +1047,7 @@ fn salvage_no_think_answer(reasoning: &str) -> Option<String> {
 
 /// How [`generate_demuxed`] resolved one assistant-turn generation.
 #[derive(Clone)]
-pub(crate) enum DemuxKind {
+pub enum DemuxKind {
     /// A non-empty answer was produced (after any reasoning).
     Answered,
     /// Reasoning ran but no usable answer followed — truncated mid-thought
@@ -1083,10 +1083,10 @@ enum DemuxIncompleteReason {
 /// [`branch`] surface lets the Best-of-N module read a
 /// candidate's outcome (#690); the budget bookkeeping stays private.
 #[derive(Clone)]
-pub(crate) struct Demux {
-    pub(crate) reasoning: String,
-    pub(crate) answer: String,
-    pub(crate) kind: DemuxKind,
+pub struct Demux {
+    pub reasoning: String,
+    pub answer: String,
+    pub kind: DemuxKind,
     incomplete_reason: Option<DemuxIncompleteReason>,
     /// All model-generated decode tokens consumed by this generation,
     /// including reasoning delimiters/hidden thinking and visible answer
@@ -2398,7 +2398,7 @@ where
 /// entry point both callers use to produce one streamed candidate.
 /// `pub(crate)` for the shared [`branch`] surface.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn generate_branch(
+pub async fn generate_branch(
     ctx: Context,
     model: &Model,
     params: &TotParams,

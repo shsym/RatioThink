@@ -277,10 +277,73 @@ path already omits it, so both modes now degrade identically on Gemma rather
 than diverging. Cooperative cancellation is not implemented in the guest (nor
 was it in chat-apc); the gateway's terminate bounds it at ~251 ms.
 
-**C — Best-of-N.** `bestofn.wasm` over `tot-core`; digest-named candidates;
-validated resume; the §6.2 commit operation.
-*Exit: **chat→Best-of-N→select/commit→chat exact hit**; round → pick →
-think-more works; A/B vs chat-apc.*
+**C — Best-of-N.** ✅ **Done.** `bestofn-core` + `bestofn.wasm` over `tot-core`;
+digest-named candidates; validated resume; the §6.2 commit operation; a guarded
+release.
+
+*Exit met*, `./Gateway/dev/run.sh bon`:
+
+| step | | `boundary_found` | `reused_tokens` |
+|------|---|---|---|
+| turn 1 | chat (cold) | false | 0 |
+| turn 2 | **Best-of-N round** | true | 22 |
+| — | **commit** | `boundary_saved=true, released=3, refused=0` | |
+| turn 3 | chat | true | 44 |
+
+Same shape as B2, and 44 > 22 again proves turn 3 hit the boundary the COMMIT
+wrote rather than falling back to the one chat left before the round. As with
+B2, the criterion is `reused_tokens`, not `exact` — see the note there.
+
+### The destructive path
+
+This is the only milestone where a guest deletes durable state on client
+instruction, and legacy had no guard at all:
+
+```rust
+fn delete_snapshot(&mut self, name: &str) -> bool {
+    Context::delete(self.model, name).is_ok()   // bestofn/release.rs:75-80
+}
+```
+
+Every name in the request, unvalidated — and pie authorizes by
+`(username, name)` with no program in the key, so a request naming
+`conv/<other chat>/…` would have deleted another conversation's KV boundary.
+`ratio_names::may_delete` now requires the name to PARSE as a digest-named
+candidate AND to carry the round's tag. Verified live: a `conv/` boundary and
+another round's candidates are both refused and counted, never deleted.
+
+**No fallback for legacy names.** The obvious one — compare the segment after
+`bon/` — degenerates to `bon/bon-0/`, which is every pre-port round of every
+chat, because chat-apc minted that segment from a counter that restarts with
+each wasm instance. A guard that authorizes a mass delete is worse than none,
+because it reads as protection. Pre-port snapshots leak once and age out, and
+the Swift sweep omits unscoped rounds rather than issuing requests that would
+be refused.
+
+### Three corrections the review forced
+
+- **`save_boundary`'s `Result` cannot report whether anything was written.** It
+  returns `Err` only for fork/flush faults; `save_one` swallowed every
+  `ctx.save` error, and the function short-circuits to `Ok` when reuse is off.
+  Gating an irreversible release on `save_boundary(...).await?` would have freed
+  the round's KV after writing nothing. It now returns `SaveOutcome`, and commit
+  gates on `full_saved`.
+- **A resume digest mismatch degrades; it does not 400.** The digest covers the
+  canonical tokens including the system turn, which the app recomputes from the
+  live profile store at think-more time — so benign drift would have killed the
+  round. `picked_text` is already mandatory precisely so the base can be rebuilt,
+  and neither branch ever serves unverified KV. Only `WrongRound` is a 400: that
+  is an authorization signal, not drift.
+- **The release sweep must group by round.** A release is authorized against one
+  `round_id`, so the app's flat cross-round name list would have had most of it
+  refused while the ack looked like a benign short release.
+
+*Scope:* the guest and gateway halves are complete and gated. On the Swift side
+the round now mints and persists its scope, the request bodies carry `round_id`
+and the commit shape exists, and the release sweep is per-round — but the view
+still calls release-on-commit rather than the new commit operation, so the app
+does not yet write a `conv/` boundary on a pick. That last wiring is a view
+change, tracked separately.
 
 Splitting B is deliberate: it previously combined hot loading, a new process
 protocol, ToT extraction and cross-mode caching in one step, which makes failures
