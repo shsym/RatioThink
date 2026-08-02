@@ -11,3 +11,12 @@ core = "^0.2.0"
 [parameters]
 count = {type = "int", optional = true, description = "events to emit before returning (default 4)"}
 hold_ms = {type = "int", optional = true, description = "busy-hold after emitting, to keep the process alive for cancel tests (default 0)"}
+
+# Read by ratio-gateway's registry. Unknown to pie, which ignores it.
+[ratio]
+route = "echo"
+protocol = "chat-v1"
+preload = true
+# Deliberately empty: echo is stateless, which is what makes it the reload
+# canary — its bytes can change with no KV consequences.
+snapshot_prefixes = []

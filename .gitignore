@@ -77,3 +77,6 @@ spec_bench_*.json
 # from the pinned revision in datasets.lock — only the lock is committed.
 Scripts/benchmark/data/
 spec_matrix_*.json
+
+# Staged inferlet artifacts for the dev gateway (built output)
+Gateway/dev/inferlets/

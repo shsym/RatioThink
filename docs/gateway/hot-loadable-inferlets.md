@@ -205,17 +205,37 @@ Therefore:
 
 ## 7. Milestones
 
-**A — shared naming + boundary I/O.** `PROMPT_MARKER`, digest naming, `conv/`,
-`save_boundary` / `open_boundary` (with the `starts_with` check) in `gen-core`;
-`ratio-names` gains `conv/`; `BoundaryDirective` added to the wire and to the
-Swift request builders; chat wired through it.
-*Exit: chat→chat exact hit; chat A/B stays byte-identical.*
+**A — shared naming + boundary I/O.** ✅ **Done** (`ecb19fe`, `29aa4ae`).
+`PROMPT_MARKER`, digest naming, `conv/`, `save_boundary` / `open_boundary` (with
+the `starts_with` check) in `gen-core`; `ratio-names` gains `conv/`;
+`BoundaryDirective` added to the wire and to the Swift request builders; chat
+wired through it.
+*Exit met: turn 2 reports `boundary_found=true, reused_tokens=22,
+prompt_tokens=34`; chat A/B 4/4 byte-identical.*
 
-**B1 — transactional registry, proven with `echo`.** Directory scan, artifact
-hashing, duplicate route/program-id rejection, immutable versions, atomic swap,
-protected `/v1/admin/reload`, protocol class plumbed (`chat-v1` only so far).
-A `OnceCell` is insufficient once an existing route's files change.
-*Exit: reload `echo` with changed bytes, no restart, no gateway rebuild.*
+**B1 — transactional registry, proven with `echo`.** ✅ **Done.** Directory scan,
+artifact hashing, duplicate route/program-id rejection, immutable versions,
+atomic swap, protected `/v1/admin/reload`, protocol class plumbed (`chat-v1`
+only so far). A `OnceCell` is insufficient once an existing route's files change.
+*Exit met: `./Gateway/dev/run.sh reload-test` edits `echo`, rebuilds, reloads,
+and asserts the new bytes are executing — no restart, no gateway rebuild.*
+
+Two corrections the gate forced, both invisible to a digest-only check:
+
+- **Install tracking is `program id → current digest`, not a set of every
+  digest seen.** `program::add` overwrites, so pie holds exactly one artifact
+  per program id. A history set makes a revert (A → B → A) skip the reinstall
+  while the engine still holds B — the reload reports success and serves the
+  wrong bytes. This is why the gate reverts as well as changes.
+- **A rebuild is not a byte change.** The wasm build is deterministic, so
+  `touch` + rebuild yields an identical digest. The gate edits real source and
+  asserts on the emitted marker, not on the digest alone.
+
+Route names come from the manifest's `[ratio]` table, including `aliases`, so
+the shipped app's `inferlet: "chat-apc"` reaches `chat` with no per-inferlet
+string in the gateway. `--inferlet-dir` replaces the four wasm/manifest flags;
+`GatewaySupervisor` passes the bundle's staged directory and no admin token, so
+reload is disabled in the shipped app.
 
 **B2 — ToT.** `tot-core` + `tot.wasm`; `BranchSink` → `&dyn EventSink`; the 15
 `sse::json_error` sites → `GenError`; `/no_think` after the fork; `tree-v1`

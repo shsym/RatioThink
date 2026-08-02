@@ -6,25 +6,35 @@
 //! OpenAI dialect; nothing here changes shape.
 
 use crate::engine::Engine;
+use crate::registry::{Entry, Installed, Registry};
 // Envelope + sequence contract come from the shared crate, so the gateway
 // and the inferlets cannot drift apart.
 use ratio_wire::{ProtocolError, SeqChecker};
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::get, routing::post};
 use pie_client::client::{Client, Process, ProcessEvent};
 use serde_json::json;
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout};
 
 pub struct AppState {
     pub engine: Engine,
-    pub inferlet: String,
-    pub chat_inferlet: String,
+    /// Swapped wholesale on reload. Readers clone the `Arc` out immediately and
+    /// never hold the lock across an await, so an in-flight request keeps
+    /// serving the version it started with even as a new one is installed.
+    pub registry: std::sync::RwLock<Arc<Registry>>,
+    pub installed: Installed,
+    /// Serializes install so two concurrent first-uses of the same lazily
+    /// installed inferlet do not both pay for `add_program`.
+    pub install_lock: tokio::sync::Mutex<()>,
+    pub inferlet_dir: PathBuf,
+    pub admin_token: Option<String>,
     /// Escape hatch if pie renames the model_status keys.
     pub model_override: Option<String>,
     /// How long to wait for the guest's first event before giving up.
@@ -33,10 +43,82 @@ pub struct AppState {
     pub cancel_grace: Duration,
 }
 
+impl AppState {
+    pub fn registry(&self) -> Arc<Registry> {
+        Arc::clone(&self.registry.read().unwrap())
+    }
+
+    /// Resolve a route name, or produce the 404 that names the alternatives —
+    /// a bare "not found" here sends people hunting for a routing bug when the
+    /// real problem is a missing file in the inferlet directory.
+    pub fn resolve(&self, route: &str) -> Result<Arc<Entry>, Response> {
+        let reg = self.registry();
+        match reg.get(route) {
+            Some(e) => Ok(Arc::clone(e)),
+            None => Err(api_error(
+                StatusCode::NOT_FOUND,
+                "inferlet_not_found",
+                &format!(
+                    "no inferlet {route:?} is registered; available: {}",
+                    reg.routes().join(", ")
+                ),
+            )),
+        }
+    }
+
+    /// Install this exact artifact version if the engine does not have it.
+    ///
+    /// Keyed on the digest, so an inferlet whose files changed reinstalls. A
+    /// per-route `OnceCell` would report success while continuing to serve the
+    /// old wasm — reload would look like it worked and change nothing.
+    pub async fn ensure_installed(&self, e: &Entry) -> anyhow::Result<()> {
+        if !self.installed.needs_install(e) {
+            return Ok(());
+        }
+        let _g = self.install_lock.lock().await;
+        if !self.installed.needs_install(e) {
+            return Ok(()); // won by another task while we waited
+        }
+        let control = self.engine.control_client().await?;
+        crate::engine::install(&control, &e.wasm, &e.manifest).await?;
+        self.installed.mark(e);
+        tracing::info!(route = %e.route, program = %e.program, digest = %e.digest, "installed");
+        Ok(())
+    }
+
+    /// Resolve, check the protocol is one the gateway can actually drive, and
+    /// make sure the engine has the bytes. The common prologue of every
+    /// generative endpoint.
+    pub async fn prepare(&self, route: &str) -> Result<Arc<Entry>, Response> {
+        let entry = self.resolve(route)?;
+        if !entry.protocol.implemented() {
+            return Err(api_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "protocol_not_implemented",
+                &format!(
+                    "inferlet {route:?} declares protocol {:?}, which the gateway cannot \
+                     drive yet. Use RATIO_CHAT_BACKEND=daemon for tree-of-thought / best-of-n.",
+                    entry.protocol.as_str()
+                ),
+            ));
+        }
+        if let Err(e) = self.ensure_installed(&entry).await {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "install_failed",
+                &e.to_string(),
+            ));
+        }
+        Ok(entry)
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/models", get(models))
+        .route("/v1/inferlets", get(list_inferlets))
+        .route("/v1/admin/reload", post(reload))
         .route("/v1/echo", post(echo))
         .route("/v1/chat/completions", post(crate::chat::chat_completions))
         .route("/v1/inferlet", post(inferlet_dispatch))
@@ -90,31 +172,144 @@ async fn models(State(st): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// `GET /v1/inferlets` — what is registered, and whether it can be driven.
+///
+/// Unauthenticated on purpose: it exposes route names and digests, which the
+/// 404 body already reveals, and it is the first thing to check when a route
+/// unexpectedly 404s.
+async fn list_inferlets(State(st): State<Arc<AppState>>) -> Response {
+    let reg = st.registry();
+    Json(json!({
+        "object": "list",
+        "dir": st.inferlet_dir.display().to_string(),
+        "data": reg.entries().map(|e| json!({
+            "route": e.route,
+            "aliases": e.aliases,
+            "program": e.program,
+            "protocol": e.protocol.as_str(),
+            "digest": e.digest,
+            "preload": e.preload,
+            "installed": !st.installed.needs_install(e),
+            "drivable": e.protocol.implemented(),
+            "snapshot_prefixes": e.snapshot_prefixes,
+        })).collect::<Vec<_>>()
+    }))
+    .into_response()
+}
+
+/// `POST /v1/admin/reload` — rescan the directory and swap atomically.
+///
+/// The swap is all-or-nothing: `Registry::scan` validates everything before
+/// returning, so a directory with one broken manifest leaves the running
+/// registry exactly as it was. In-flight requests keep the `Arc` they resolved
+/// against and finish on the old version.
+async fn reload(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    // 404, not 401: without a token this endpoint does not exist, and saying
+    // "unauthorized" would advertise an admin surface that cannot be used.
+    let Some(expected) = st.admin_token.as_deref() else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "admin_disabled",
+            "reload is disabled; start the gateway with --admin-token to enable it",
+        );
+    };
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return api_error(StatusCode::UNAUTHORIZED, "unauthorized", "bad admin token");
+    }
+
+    let next = match Registry::scan(&st.inferlet_dir) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            tracing::warn!(error = %e, "reload rejected; keeping the current registry");
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_inferlet_dir",
+                &format!("{e:#} — the previous registry is still serving"),
+            );
+        }
+    };
+
+    let before: Vec<(String, String)> = st
+        .registry()
+        .entries()
+        .map(|e| (e.route.clone(), e.digest.clone()))
+        .collect();
+    *st.registry.write().unwrap() = Arc::clone(&next);
+
+    // Reinstall eagerly for anything marked preload whose bytes changed; the
+    // rest reinstalls on next use, since `Installed` keys on the digest.
+    let mut changed = Vec::new();
+    for e in next.entries() {
+        let was = before.iter().find(|(r, _)| *r == e.route).map(|(_, d)| d.as_str());
+        if was != Some(e.digest.as_str()) {
+            changed.push(json!({"route": e.route, "from": was, "to": e.digest}));
+            if e.preload {
+                if let Err(err) = st.ensure_installed(e).await {
+                    // The registry already points at the new version, so this
+                    // route will retry the install on its next request.
+                    tracing::warn!(route = %e.route, error = %err, "preload after reload failed");
+                }
+            }
+        }
+    }
+    tracing::info!(changed = changed.len(), "registry reloaded");
+    Json(json!({"reloaded": true, "routes": next.routes(), "changed": changed})).into_response()
+}
+
+/// Length-independent only for equal-length inputs, which is enough here: the
+/// token length is not a secret worth protecting.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// `POST /v1/inferlet` — the app's raw dispatch endpoint (4 call sites).
 ///
-/// Present deliberately: a 404 here reads as "wrong URL" and sends people
-/// hunting for a routing bug. A 501 with the inferlet name says exactly what is
-/// missing and which backend still has it.
-async fn inferlet_dispatch(body: axum::body::Bytes) -> Response {
+/// Distinguishes the two failures that used to look alike: an inferlet that is
+/// not registered (404, listing what is) versus one that is registered but
+/// speaks a protocol class the gateway cannot drive yet (501, naming it).
+async fn inferlet_dispatch(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
     let name = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v.get("inferlet").and_then(|s| s.as_str()).map(str::to_string))
-        .unwrap_or_else(|| "<unspecified>".into());
-    api_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "inferlet_not_implemented",
-        &format!(
-            "/v1/inferlet ({name}) is not implemented on the gateway backend yet. \
-             Use RATIO_CHAT_BACKEND=daemon until the advanced inferlets are ported."
+        .unwrap_or_default();
+    if name.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "POST /v1/inferlet requires an \"inferlet\" field",
+        );
+    }
+    match st.prepare(&name).await {
+        // Resolvable and drivable, but this endpoint's own request shape is not
+        // ported. B2/C replace this arm with the tree-v1 driver.
+        Ok(e) => api_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "dispatch_not_implemented",
+            &format!(
+                "/v1/inferlet cannot yet drive {:?} ({}); use POST /v1/chat/completions",
+                e.route,
+                e.protocol.as_str()
+            ),
         ),
-    )
+        Err(resp) => resp,
+    }
 }
 
-fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
+pub fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     let kind = match status.as_u16() {
         400 => "invalid_request_error",
+        401 => "authentication_error",
         404 => "not_found_error",
         413 => "payload_too_large_error",
+        501 => "not_implemented_error",
         503 => "service_unavailable_error",
         _ => "server_error",
     };
@@ -150,6 +345,11 @@ async fn echo(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Respo
         }
     };
 
+    let entry = match st.prepare("echo").await {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+
     let client = match st.engine.request_client().await {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -158,7 +358,7 @@ async fn echo(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Respo
     };
 
     let mut proc = match client
-        .launch_process(st.inferlet.clone(), input, /* capture_outputs */ true, None)
+        .launch_process(entry.program.clone(), input, /* capture_outputs */ true, None)
         .await
     {
         Ok(p) => p,

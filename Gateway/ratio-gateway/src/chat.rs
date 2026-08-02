@@ -83,23 +83,23 @@ pub async fn chat_completions(
     };
 
     // §2: a dispatch-shaped request (`inferlet:` naming tree-of-thought or
-    // best-of-n) is NOT an ordinary chat request. Without this it would
-    // deserialize as a plain ChatRequest, silently drop the advanced envelope,
-    // and answer as if the profile had never been selected — a wrong answer,
-    // not an error. Until those inferlets are ported, say so plainly.
-    if let Some(name) = raw.get("inferlet").and_then(|v| v.as_str()) {
-        if !name.is_empty() && name != "chat-apc" {
-            return api_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "inferlet_not_implemented",
-                &format!(
-                    "inferlet {name:?} is not available on the gateway backend yet; \
-                     only plain chat is ported. Use RATIO_CHAT_BACKEND=daemon for \
-                     tree-of-thought / best-of-n."
-                ),
-            );
-        }
-    }
+    // best-of-n) is NOT an ordinary chat request. Without routing on this field
+    // it would deserialize as a plain ChatRequest, silently drop the advanced
+    // envelope, and answer as if the profile had never been selected — a wrong
+    // answer, not an error.
+    //
+    // The registry decides what that name means. `chat-apc` from the shipped
+    // app reaches `chat` through a manifest alias rather than a string compare
+    // here, so the gateway has no per-inferlet knowledge to update.
+    let route = raw
+        .get("inferlet")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("chat");
+    let entry = match st.prepare(route).await {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
 
     // Only routing/transport fields are read here. Everything else — roles,
     // sampling bounds, cue mode — belongs to gen-core.
@@ -135,7 +135,7 @@ pub async fn chat_completions(
         }
     };
     let mut proc = match client
-        .launch_process(st.chat_inferlet.clone(), input, true, None)
+        .launch_process(entry.program.clone(), input, true, None)
         .await
     {
         Ok(p) => p,

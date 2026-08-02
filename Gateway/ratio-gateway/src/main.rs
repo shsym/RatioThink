@@ -5,11 +5,13 @@
 
 mod chat;
 mod engine;
+mod registry;
 mod routes;
 
 use anyhow::{Result, bail};
 use clap::Parser;
 use engine::Engine;
+use registry::Registry;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -36,20 +38,21 @@ struct Args {
     #[arg(long, default_value = "/tmp/ratio-gateway-pie-home")]
     pie_home: PathBuf,
 
+    /// Directory of `{name}.wasm` + `{name}.Pie.toml` pairs. Adding an inferlet
+    /// that speaks an already-supported protocol class means dropping two files
+    /// here and reloading — no gateway rebuild.
+    ///
+    /// TRUSTED (plan §3, hole 3): pie authorizes snapshots by
+    /// `(username, name)` with no program in the key, so an inferlet here can
+    /// read or delete any snapshot regardless of what its manifest declares.
+    /// This is not a sandbox for untrusted third-party code.
     #[arg(long)]
-    inferlet_wasm: PathBuf,
-    #[arg(long)]
-    inferlet_manifest: PathBuf,
-    #[arg(long, default_value = "echo@0.1.0")]
-    inferlet_id: String,
-    /// Program id for POST /v1/chat/completions.
-    #[arg(long, default_value = "chat@0.1.0")]
-    chat_inferlet_id: String,
-    /// Extra wasm to install at boot (the chat inferlet).
-    #[arg(long)]
-    chat_wasm: Option<PathBuf>,
-    #[arg(long)]
-    chat_manifest: Option<PathBuf>,
+    inferlet_dir: PathBuf,
+    /// Bearer token for `POST /v1/admin/reload`. Reload is disabled unless set:
+    /// the gateway can be exposed beyond loopback, and an unauthenticated
+    /// reload lets anyone swap in whatever is on disk.
+    #[arg(long, env = "RATIO_ADMIN_TOKEN")]
+    admin_token: Option<String>,
     /// Serve this single model id from /v1/models instead of querying pie.
     #[arg(long)]
     model: Option<String>,
@@ -91,23 +94,37 @@ async fn main() -> Result<()> {
     };
     tracing::info!(url = %engine.url, "engine ready");
 
-    // Install once at boot on the control connection (§8.4).
-    let control = engine.control_client().await?;
-    engine::install(&control, &args.inferlet_wasm, &args.inferlet_manifest).await?;
-    tracing::info!(inferlet = %args.inferlet_id, "installed");
-    if let (Some(w), Some(m)) = (&args.chat_wasm, &args.chat_manifest) {
-        engine::install(&control, w, m).await?;
-        tracing::info!(inferlet = %args.chat_inferlet_id, "installed");
+    // Scan before serving: a malformed manifest must fail startup loudly rather
+    // than surface as a 404 on the one route that happened to be broken.
+    let reg = Arc::new(Registry::scan(&args.inferlet_dir)?);
+    for e in reg.entries() {
+        tracing::info!(
+            route = %e.route, program = %e.program, protocol = %e.protocol.as_str(),
+            digest = %e.digest, preload = e.preload, aliases = ?e.aliases,
+            "registered"
+        );
+    }
+    if args.admin_token.is_none() {
+        tracing::warn!("no --admin-token: POST /v1/admin/reload will return 404");
     }
 
     let state = Arc::new(routes::AppState {
         engine,
-        inferlet: args.inferlet_id.clone(),
-        chat_inferlet: args.chat_inferlet_id.clone(),
+        registry: std::sync::RwLock::new(Arc::clone(&reg)),
+        installed: registry::Installed::default(),
+        install_lock: tokio::sync::Mutex::new(()),
+        inferlet_dir: args.inferlet_dir.clone(),
+        admin_token: args.admin_token.clone(),
         model_override: args.model.clone(),
         first_event_timeout: Duration::from_secs(args.first_event_timeout_s),
         cancel_grace: Duration::from_millis(args.cancel_grace_ms),
     });
+
+    // Eager install for `preload = true`; everything else installs on first use,
+    // so a rarely-used inferlet costs nothing at boot.
+    for e in reg.entries().filter(|e| e.preload) {
+        state.ensure_installed(e).await?;
+    }
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     let bound = listener.local_addr()?;

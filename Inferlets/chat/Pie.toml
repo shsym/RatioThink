@@ -14,3 +14,16 @@ model = {type = "string", description = "engine-registered model id"}
 max_tokens = {type = "int", optional = true, description = "default 1024"}
 temperature = {type = "float", optional = true, description = "default 0.7"}
 top_p = {type = "float", optional = true, description = "default 1.0"}
+
+# Read by ratio-gateway's registry (Gateway/ratio-gateway/src/registry.rs).
+# Unknown to pie, which ignores it.
+[ratio]
+route = "chat"
+# The shipped app sends inferlet:"chat-apc"; keep that name working without a
+# hardcoded string in the gateway.
+aliases = ["chat-apc"]
+protocol = "chat-v1"
+preload = true
+# Declarative, for GC scoping and collision review — NOT enforced. pie keys
+# snapshot authorization on (username, name) with no program in the key.
+snapshot_prefixes = ["conv/"]

@@ -92,10 +92,11 @@ public actor GatewaySupervisor {
       "--listen", "127.0.0.1:0",           // ephemeral; we read the real port back
       "--pie-url", spec.pieURL,
       "--pie-token", spec.pieToken,
-      "--chat-wasm", spec.inferlets.appendingPathComponent("chat.wasm").path,
-      "--chat-manifest", spec.inferlets.appendingPathComponent("chat.Pie.toml").path,
-      "--inferlet-wasm", spec.inferlets.appendingPathComponent("echo.wasm").path,
-      "--inferlet-manifest", spec.inferlets.appendingPathComponent("echo.Pie.toml").path,
+      // The gateway scans this directory for `{name}.wasm` + `{name}.Pie.toml`
+      // pairs, so shipping a new inferlet is a bundle change, not a code change.
+      // No `--admin-token`: the bundle is read-only and reload would have
+      // nothing new to find, so /v1/admin/reload stays disabled here.
+      "--inferlet-dir", spec.inferlets.path,
       "--port-file", portFile.path,
     ]
     let pipe = Pipe()
