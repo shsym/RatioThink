@@ -169,7 +169,11 @@ for l in sys.stdin:
 cmd_test() {
   need_cargo
   echo "==> ratio-wire (golden + forward-compat)"; ( cd "$REPO/Inferlets/ratio-wire" && cargo test )
-  echo "==> gen-core (schema/demux/prompt)";        ( cd "$REPO/Inferlets/gen-core"  && cargo test --lib )
+  echo "==> gen-core (schema/demux/prompt/boundary)"; ( cd "$REPO/Inferlets/gen-core"  && cargo test --lib )
+  echo "==> ratio-names";                            ( cd "$REPO/Inferlets/ratio-names" && cargo test )
+  # Both feature states: the exec-strategies gate changes which `exec` values
+  # `resolve` accepts, and only the OFF build is what ships.
+  echo "==> tot-core (tree/diversity/schema)";       ( cd "$REPO/Inferlets/tot-core" && cargo test --lib && cargo test --lib --features exec-strategies )
   echo "==> gateway";                                ( cd "$REPO/Gateway"             && cargo test )
 }
 

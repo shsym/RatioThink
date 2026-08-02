@@ -136,6 +136,91 @@ fn reproduces_captured_bestofn_frames() {
     check_tree_fixture("bestofn_stream.sse", "bon-0");
 }
 
+/// Parse one captured meta frame back into the neutral `Event` it represents.
+///
+/// `None` for frames that belong to the linear path and are covered by the chat
+/// golden test. Panicking on anything unrecognized is deliberate: a new frame
+/// kind appearing in a capture means the `Event` vocabulary is incomplete, and
+/// silently skipping it would let a port drop it unnoticed.
+fn tree_event(kind: &str, v: &Value) -> Option<Event> {
+    Some(match kind {
+        "tree_start" => Event::TreeStart {
+            breadth: v["breadth"].as_u64().unwrap() as u32,
+            depth: v["depth"].as_u64().unwrap() as u32,
+            beam_width: v["beam_width"].as_u64().unwrap() as u32,
+        },
+        "node_start" => Event::NodeStart {
+            id: v["id"].as_str().unwrap().into(),
+            parent_id: v["parent_id"].as_str().unwrap().into(),
+            depth: v["depth"].as_u64().unwrap() as u32,
+            branch_index: v["branch_index"].as_u64().unwrap() as u32,
+        },
+        "node_delta" => Event::NodeDelta {
+            id: v["id"].as_str().unwrap().into(),
+            channel: match v["kind"].as_str().unwrap() {
+                "reasoning" => Channel::Reasoning,
+                "answer" => Channel::Answer,
+                o => panic!("unknown node_delta kind {o}"),
+            },
+            text: v["text"].as_str().unwrap().into(),
+        },
+        "node_scoring" => Event::NodeScoring { id: v["id"].as_str().unwrap().into() },
+        "node_complete" => {
+            let n = &v["node"];
+            Event::NodeComplete {
+                node: NodeView {
+                    id: n["id"].as_str().unwrap().into(),
+                    parent_id: n["parent_id"].as_str().map(Into::into),
+                    depth: n["depth"].as_u64().unwrap() as u32,
+                    branch_index: n["branch_index"].as_u64().map(|x| x as u32),
+                    content: n["content"].as_str().unwrap().into(),
+                    reasoning: n.get("reasoning").and_then(Value::as_str).unwrap_or("").into(),
+                    score: n["score"].as_u64().map(|x| x as u8),
+                    status: n["status"].as_str().unwrap().into(),
+                    error: n.get("error").and_then(Value::as_str).map(Into::into),
+                    score_error: n.get("score_error").and_then(Value::as_str).map(Into::into),
+                },
+            }
+        }
+        "level_pruned" => Event::LevelPruned {
+            level: v["level"].as_u64().unwrap() as u32,
+            kept: v["kept"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect(),
+        },
+        "final_delta" => Event::FinalDelta { text: v["text"].as_str().unwrap().into() },
+        "generation_metrics" => Event::GenerationMetrics {
+            output_tokens: v["output_tokens"].as_u64().unwrap() as u32,
+            elapsed_s: v["elapsed_s"].as_f64().unwrap(),
+            tokens_per_sec: v["tokens_per_sec"].as_f64().unwrap(),
+        },
+        "tree_complete" => Event::TreeComplete {
+            selected_node_id: v.get("selected_node_id").and_then(Value::as_str).map(Into::into),
+            final_answer: v.get("final_answer").and_then(Value::as_str).map(Into::into),
+            synthesized: v["synthesized"].as_bool().unwrap(),
+        },
+        "awaiting_selection" => Event::AwaitingSelection {
+            level: v["level"].as_u64().unwrap() as u32,
+            candidates: v["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| Pick {
+                    id: c["id"].as_str().unwrap().into(),
+                    branch_index: c["branch_index"].as_u64().unwrap() as u32,
+                    snapshot_name: c["snapshot_name"].as_str().unwrap().into(),
+                })
+                .collect(),
+        },
+        // Linear-path frames; the chat golden test owns these.
+        "usage" | "model_ready" => return None,
+        other => panic!("unhandled frame `{other}` — the Event vocabulary is incomplete"),
+    })
+}
+
 fn check_tree_fixture(name: &str, tree_id: &str) {
     let raw = fixture(name);
     let payloads = payloads(&raw);
@@ -145,80 +230,9 @@ fn check_tree_fixture(name: &str, tree_id: &str) {
         let Some(kind) = meta_kind(p) else { continue };
         let v: Value = serde_json::from_str(p).unwrap();
         let model = v.get("model").and_then(Value::as_str).unwrap_or("qwen");
+        let Some(ev) = tree_event(&kind, &v) else { continue };
 
-        let ev = match kind.as_str() {
-            "tree_start" => Event::TreeStart {
-                breadth: v["breadth"].as_u64().unwrap() as u32,
-                depth: v["depth"].as_u64().unwrap() as u32,
-                beam_width: v["beam_width"].as_u64().unwrap() as u32,
-            },
-            "node_start" => Event::NodeStart {
-                id: v["id"].as_str().unwrap().into(),
-                parent_id: v["parent_id"].as_str().unwrap().into(),
-                depth: v["depth"].as_u64().unwrap() as u32,
-                branch_index: v["branch_index"].as_u64().unwrap() as u32,
-            },
-            "node_delta" => Event::NodeDelta {
-                id: v["id"].as_str().unwrap().into(),
-                channel: match v["kind"].as_str().unwrap() {
-                    "reasoning" => Channel::Reasoning,
-                    "answer" => Channel::Answer,
-                    o => panic!("unknown node_delta kind {o}"),
-                },
-                text: v["text"].as_str().unwrap().into(),
-            },
-            "node_scoring" => Event::NodeScoring { id: v["id"].as_str().unwrap().into() },
-            "node_complete" => {
-                let n = &v["node"];
-                Event::NodeComplete {
-                    node: NodeView {
-                        id: n["id"].as_str().unwrap().into(),
-                        parent_id: n["parent_id"].as_str().map(Into::into),
-                        depth: n["depth"].as_u64().unwrap() as u32,
-                        branch_index: n["branch_index"].as_u64().map(|x| x as u32),
-                        content: n["content"].as_str().unwrap().into(),
-                        reasoning: n.get("reasoning").and_then(Value::as_str).unwrap_or("").into(),
-                        score: n["score"].as_u64().map(|x| x as u8),
-                        status: n["status"].as_str().unwrap().into(),
-                        error: n.get("error").and_then(Value::as_str).map(Into::into),
-                        score_error: n.get("score_error").and_then(Value::as_str).map(Into::into),
-                    },
-                }
-            }
-            "level_pruned" => Event::LevelPruned {
-                level: v["level"].as_u64().unwrap() as u32,
-                kept: v["kept"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|x| x.as_str().unwrap().to_string())
-                    .collect(),
-            },
-            "final_delta" => Event::FinalDelta { text: v["text"].as_str().unwrap().into() },
-            "tree_complete" => Event::TreeComplete {
-                selected_node_id: v.get("selected_node_id").and_then(Value::as_str).map(Into::into),
-                final_answer: v.get("final_answer").and_then(Value::as_str).map(Into::into),
-                synthesized: v["synthesized"].as_bool().unwrap(),
-            },
-            "awaiting_selection" => Event::AwaitingSelection {
-                level: v["level"].as_u64().unwrap() as u32,
-                candidates: v["candidates"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|c| Pick {
-                        id: c["id"].as_str().unwrap().into(),
-                        branch_index: c["branch_index"].as_u64().unwrap() as u32,
-                        snapshot_name: c["snapshot_name"].as_str().unwrap().into(),
-                    })
-                    .collect(),
-            },
-            // Shared with the linear path, covered by the chat golden test.
-            "generation_metrics" | "usage" | "model_ready" => continue,
-            other => panic!("unhandled frame `{other}` in {name} — the Event vocabulary is incomplete"),
-        };
-
-        let mut r = OpenAiSse::new(tree_id, model, 0);
+        let mut r = OpenAiSse::new(tree_id, model, 0).with_tree_metrics(true);
         let out = r.render(&ev);
         assert_eq!(out.len(), 1, "{kind} should render exactly one frame");
         assert_eq!(out[0], *p, "{kind} frame differs\n got: {}\n exp: {p}", out[0]);
@@ -227,4 +241,104 @@ fn check_tree_fixture(name: &str, tree_id: &str) {
 
     assert!(!checked.is_empty(), "{name} produced no tree frames");
     println!("{name}: verified {} distinct frame kinds: {checked:?}", checked.len());
+}
+
+// ---------------------------------------------------------------------------
+// Whole-stream acceptance
+// ---------------------------------------------------------------------------
+
+/// The per-frame test above is NOT acceptance: it renders each frame with a
+/// fresh renderer and never checks order, count, or the `[DONE]` sentinel. A
+/// port could emit these frames in any sequence, drop `generation_metrics`
+/// entirely, and omit `[DONE]`, and it would still pass.
+///
+/// This is the real B2 target — the whole captured stream, in order, through
+/// ONE renderer, byte for byte. Note what it pins beyond bytes:
+///
+/// * **No `Ready`, no finish chunk, no `usage`.** A tree stream contains zero
+///   `chat.completion.chunk` objects. `terminal()` unconditionally emits a
+///   finish chunk, so the tree driver must never call it.
+/// * **`generation_metrics` is mid-stream**, before `tree_complete`.
+/// * **Interleaving is load-bearing.** Both `node_start`s precede every delta
+///   and the two nodes' deltas alternate — evidence the branches ran
+///   concurrently. A sequential port produces a stream that decodes the same
+///   and compares differently.
+/// * **`node_complete` is batched.** Both arrive together, in branch_index
+///   order, immediately before `level_pruned` — not when each branch finishes.
+#[test]
+fn reproduces_captured_tree_stream_byte_for_byte() {
+    check_tree_stream("tot_stream.sse", "tot-0");
+}
+
+#[test]
+fn reproduces_captured_bestofn_stream_byte_for_byte() {
+    check_tree_stream("bestofn_stream.sse", "bon-0");
+}
+
+fn check_tree_stream(name: &str, tree_id: &str) {
+    let raw = fixture(name);
+    let expected = payloads(&raw);
+    assert!(!expected.is_empty(), "fixture had no data frames");
+    assert_eq!(expected.last().map(String::as_str), Some("[DONE]"), "{name} must end with [DONE]");
+
+    let model = expected
+        .iter()
+        .find_map(|p| {
+            let v: Value = serde_json::from_str(p).ok()?;
+            v.get("model")?.as_str().map(str::to_string)
+        })
+        .expect("no frame carried a model id");
+
+    let events: Vec<Event> = expected
+        .iter()
+        .filter(|p| p.as_str() != "[DONE]")
+        .filter_map(|p| {
+            let kind = meta_kind(p)?;
+            let v: Value = serde_json::from_str(p).unwrap();
+            tree_event(&kind, &v)
+        })
+        .collect();
+
+    let mut r = OpenAiSse::new(tree_id, &model, 0).with_tree_metrics(true);
+    let mut got: Vec<String> = events.iter().flat_map(|e| r.render(e)).collect();
+    // The guest's terminal event ends the stream; the gateway appends only the
+    // sentinel. `terminal()` is deliberately NOT called — it would prepend an
+    // OpenAI finish chunk that no tree capture contains.
+    got.push("[DONE]".into());
+
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "{name}: frame count differs (got {}, want {})",
+        got.len(),
+        expected.len()
+    );
+    for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(g, e, "{name}: frame {i} differs\n got: {g}\n exp: {e}");
+    }
+}
+
+/// `generation_metrics` must vanish in chat mode and appear in tree mode. The
+/// default is chat, so a tree driver that forgets `with_tree_metrics` silently
+/// drops the frame rather than failing.
+#[test]
+fn generation_metrics_renders_only_in_tree_mode() {
+    let ev = Event::GenerationMetrics {
+        output_tokens: 283,
+        elapsed_s: 14.017725042,
+        tokens_per_sec: 0.0, // deliberately wrong: the renderer recomputes
+    };
+    assert!(
+        OpenAiSse::new("tot-0", "qwen", 0).render(&ev).is_empty(),
+        "chat mode must defer metrics to terminal()"
+    );
+    let out = OpenAiSse::new("tot-0", "qwen", 0).with_tree_metrics(true).render(&ev);
+    assert_eq!(
+        out,
+        vec![
+            r#"{"event":"generation_metrics","output_tokens":283,"elapsed_s":14.017725042,"tokens_per_sec":20.188725285456343}"#
+                .to_string()
+        ],
+        "tree mode must emit the frame and recompute tokens_per_sec"
+    );
 }

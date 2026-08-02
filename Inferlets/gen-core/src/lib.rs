@@ -92,8 +92,12 @@ pub async fn run_chat(
     // and save from the untouched original. Reconstructing the boundary after
     // generation risks folding cue/reasoning tokens into it.
     let directive = req.boundary.clone().unwrap_or_default();
+    // `&req.model` is the membership-checked id from the loop above, and it is
+    // what gets hashed into the boundary name. Every other mode must digest
+    // this same resolved string or it computes a different name for the same
+    // history and silently orphans the boundary.
     let canonical =
-        boundary::open_canonical(&model, &req.model, &directive, &req.messages)?;
+        boundary::open_canonical(&model, &req.model, &directive, &req.messages).await?;
     let mut ctx = canonical
         .ctx
         .fork()
@@ -271,8 +275,21 @@ pub async fn run_chat(
 
     // ORDERING: complete the save BEFORE the caller emits its terminal event,
     // or the next request can race it and miss.
+    //
+    // BEST-EFFORT, never `?`. A failed save costs the NEXT turn a re-prefill; it
+    // does not make this turn wrong. Propagating it would send `run_chat`'s
+    // caller down the failure path, which emits an Error event and returns
+    // `GenResult::default()` — discarding the content, token counts and finish
+    // reason of a turn that already completed and already streamed. On the
+    // buffered path that is a blank response. Fork/flush faults are most likely
+    // under exactly the KV pressure that makes saving valuable, so this is not
+    // a hypothetical ordering.
     if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) && !content.is_empty() {
-        boundary::save_boundary(&canonical, &model, &req.model, &directive, &content).await?;
+        if let Err(e) =
+            boundary::save_boundary(&canonical, &model, &req.model, &directive, &content).await
+        {
+            eprintln!("[gen-core] boundary save failed ({}): {}", e.code, e.message);
+        }
     }
 
     Ok(GenResult {

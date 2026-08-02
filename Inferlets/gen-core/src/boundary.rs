@@ -34,7 +34,13 @@ const LADDER_DEPTH: usize = 4;
 /// Conversation identity plus caching policy, carried on every generative
 /// request. Top-level rather than per-inferlet: ToT and Best-of-N could not
 /// name a boundary at all without it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `Default` is written out rather than derived so it agrees with what serde
+/// produces for `{}`. A derived `Default` gives `enabled: false` while
+/// `#[serde(default = "yes")]` gives `true`, so a test constructing
+/// `BoundaryDirective { key: k, ..Default::default() }` would silently exercise
+/// the reuse-disabled path and assert on code that never ran.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoundaryDirective {
     /// Opaque conversation id. Hashed into the name, never interpolated raw.
     pub key: String,
@@ -50,6 +56,12 @@ pub struct BoundaryDirective {
 
 fn yes() -> bool {
     true
+}
+
+impl Default for BoundaryDirective {
+    fn default() -> Self {
+        Self { key: String::new(), compat: String::new(), turn: 0, enabled: yes() }
+    }
 }
 
 /// What actually happened, for diagnostics and tests.
@@ -113,7 +125,19 @@ fn ladder(
 
 /// Entry half: a context holding the canonical prompt, reusing a saved
 /// boundary when one is available.
-pub fn open_canonical(
+///
+/// `model_id` MUST be the resolved, membership-checked engine model id — the
+/// same string every mode uses. It is hashed into the name, so a mode that
+/// trims, case-folds or default-fills it computes a different name for the same
+/// history and orphans the boundary silently, with no error anywhere.
+///
+/// Returns FLUSHED. The flush is here rather than at the call site because
+/// `Context::fork` clones the unflushed buffer: forking first makes both the
+/// fork and the later `save_boundary` fork replay the same prefill. Flushing
+/// once up front materializes the pages, both forks inherit them, and
+/// `save_boundary`'s own flush degrades to a no-op. Token sequences — and so
+/// the digest — are unchanged either way; only the work is.
+pub async fn open_canonical(
     model: &Model,
     model_id: &str,
     directive: &BoundaryDirective,
@@ -137,6 +161,9 @@ pub fn open_canonical(
             if !suffix.is_empty() {
                 ctx.append(suffix);
             }
+            ctx.flush()
+                .await
+                .map_err(|e| GenError::new(crate::classify_engine_error(&e), e))?;
             return Ok(Canonical {
                 ctx,
                 outcome: OpenOutcome {
@@ -152,6 +179,9 @@ pub fn open_canonical(
 
     let mut ctx = Context::new(model).map_err(|e| GenError::new("context_failed", e))?;
     ctx.append(&canonical);
+    ctx.flush()
+        .await
+        .map_err(|e| GenError::new(crate::classify_engine_error(&e), e))?;
     Ok(Canonical {
         outcome: OpenOutcome::cold(canonical.len()),
         tokens: canonical,

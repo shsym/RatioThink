@@ -1202,7 +1202,7 @@ public final class ChatSendController: ObservableObject {
 /// JSON body for the tree-of-thought advanced-profile dispatch `input`.
 /// snake_case keys mirror the engine's `TotInput` schema; `temperature` /
 /// `top_p` come from the shared sampling, the rest from the ToT profile.
-private struct ToTRequestInput: Encodable {
+struct ToTRequestInput: Encodable {
   let model: String
   /// Conversation identity for the shared KV boundary (see gen-core).
   let boundary: ChatCacheDirective?
@@ -1214,8 +1214,12 @@ private struct ToTRequestInput: Encodable {
   let temperature: Double
   let topP: Double
 
+  // An explicit CodingKeys suppresses synthesis for anything absent, so a
+  // property missing here is dropped silently — it still compiles and still
+  // type-checks. `boundary` was missing, which meant ToT dispatches carried no
+  // conversation identity and chat -> ToT -> chat could never reuse KV.
   private enum CodingKeys: String, CodingKey {
-    case model, messages, breadth, depth, temperature
+    case model, boundary, messages, breadth, depth, temperature
     case beamWidth = "beam_width"
     case maxTokensPerNode = "max_tokens_per_node"
     case topP = "top_p"
@@ -1225,7 +1229,7 @@ private struct ToTRequestInput: Encodable {
 /// Advanced-profile dispatch body for a Best-of-N round (#690). Round-1 leaves
 /// the resume fields nil → the synthesized `Encodable` omits them
 /// (`encodeIfPresent`), so the server reads it as a fresh round.
-private struct BestOfNRequestInput: Encodable {
+struct BestOfNRequestInput: Encodable {
   let model: String
   /// Conversation identity for the shared KV boundary (see gen-core).
   let boundary: ChatCacheDirective?
@@ -1241,8 +1245,9 @@ private struct BestOfNRequestInput: Encodable {
   let unpicked: [String]?
   let level: Int?
 
+  // Same omission as ToTRequestInput — see the note there.
   private enum CodingKeys: String, CodingKey {
-    case model, messages, n, temperature, level, unpicked, thinking
+    case model, boundary, messages, n, temperature, level, unpicked, thinking
     case maxTokensPerCandidate = "max_tokens_per_candidate"
     case topP = "top_p"
     case resumeFrom = "resume_from"

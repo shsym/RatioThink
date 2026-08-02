@@ -169,6 +169,7 @@ pub struct OpenAiSse {
     created: i64,
     role_emitted: bool,
     include_usage: bool,
+    tree_inline_metrics: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
 }
@@ -181,6 +182,7 @@ impl OpenAiSse {
             created,
             role_emitted: false,
             include_usage: false,
+            tree_inline_metrics: false,
             prompt_tokens: 0,
             completion_tokens: 0,
         }
@@ -188,6 +190,25 @@ impl OpenAiSse {
 
     pub fn with_usage_chunk(mut self, yes: bool) -> Self {
         self.include_usage = yes;
+        self
+    }
+
+    /// Render `GenerationMetrics` inline instead of deferring it to
+    /// `terminal()`. Required for `tree-v1` and wrong for `chat-v1`.
+    ///
+    /// The two protocols put this frame in genuinely different places. Chat's
+    /// terminal sequence is finish-chunk → [usage chunk] → metrics → usage →
+    /// [DONE], all assembled at once by `terminal()` because the order depends
+    /// on values that arrive after the finish. A tree stream has no finish
+    /// chunk and no usage frame at all: the capture ends
+    /// `final_delta → generation_metrics → tree_complete → [DONE]`, so the
+    /// metrics frame sits mid-stream, before a terminal event the guest emits.
+    ///
+    /// Without this flag the arm returns an empty `Vec` and the frame vanishes
+    /// with no error and no test failure — the tree golden test skips
+    /// `generation_metrics` entirely — so it is only findable by diffing bytes.
+    pub fn with_tree_metrics(mut self, yes: bool) -> Self {
+        self.tree_inline_metrics = yes;
         self
     }
 
@@ -252,8 +273,29 @@ impl OpenAiSse {
                 self.completion_tokens = *completion_tokens;
                 Vec::new()
             }
-            // Also terminal-sequence owned; the gateway supplies elapsed time.
-            Event::GenerationMetrics { .. } => Vec::new(),
+            // chat-v1: terminal-sequence owned, so nothing here (the gateway
+            // supplies elapsed time). tree-v1: inline, from the guest's own
+            // counts — only the guest can total branch + scorer + synthesis
+            // tokens, and the gateway has no way to derive that number.
+            Event::GenerationMetrics { output_tokens, elapsed_s, .. } => {
+                if !self.tree_inline_metrics {
+                    return Vec::new();
+                }
+                // `tokens_per_sec` is RECOMPUTED, not taken from the event. The
+                // captured value is exactly this division
+                // (283 / 14.017725042 == 20.188725285456343), and having one
+                // formula means the field cannot drift from the pair it
+                // summarizes.
+                vec![
+                    serde_json::to_string(&MetaGenMetrics {
+                        event: "generation_metrics",
+                        output_tokens: *output_tokens,
+                        elapsed_s: *elapsed_s,
+                        tokens_per_sec: *output_tokens as f64 / *elapsed_s,
+                    })
+                    .unwrap(),
+                ]
+            }
 
             // ---- tree frames: pass through, with gateway-owned id/model ----
             Event::TreeStart { breadth, depth, beam_width } => {

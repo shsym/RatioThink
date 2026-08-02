@@ -149,7 +149,13 @@ final class ChatSendControllerTests: XCTestCase {
         sampling: ChatSampling(temperature: 0.2, topP: 0.8, maxTokens: 64),
         // #522: every send carries a per-chat prefix-cache directive
         // (system override + 1 user message → boundary turn 2).
-        cache: ChatCacheDirective(key: chat.id.uuidString, turn: 2)
+        cache: ChatCacheDirective(key: chat.id.uuidString, turn: 2),
+        // The mode-neutral KV boundary directive. Same key and turn as
+        // `cache`, because both are derived from the same conversation
+        // identity — but a separate field, since `cache` is chat-apc's
+        // per-inferlet APC directive and this one is what ToT and Best-of-N
+        // also carry so all three modes name the same `conv/` boundary.
+        boundary: ChatCacheDirective(key: chat.id.uuidString, turn: 2)
       )
     ])
     XCTAssertEqual(chat.messages.count, 2)
