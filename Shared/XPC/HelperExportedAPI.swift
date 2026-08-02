@@ -339,6 +339,22 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// reply blocks may be invoked from any thread so the observer
   /// is self-cancelling via the token argument from
   /// `PieEngineHost.observe` (review v1 F3) — no tokenBox race.
+  /// Backend-aware start. Delegates to the existing path after recording the
+  /// caller's choice, so the gateway/daemon decision travels with the request
+  /// instead of depending on the helper's launchd environment.
+  public func startEngineWithBackend(profileID: String,
+                                     modelOverride: String?,
+                                     chatBackend: String,
+                                     reply: @escaping (Data?, Data?) -> Void) {
+    requestedChatBackend = ChatBackend(rawValue: chatBackend.lowercased()) ?? .daemon
+    startEngine(profileID: profileID, modelOverride: modelOverride, reply: reply)
+  }
+
+  /// Backend for the next launch. Set by the XPC call above; defaults to the
+  /// environment so CLI harnesses and the existing (non-backend) start method
+  /// keep working unchanged.
+  var requestedChatBackend: ChatBackend = ChatBackend.fromEnvironment()
+
   public func startEngine(profileID: String,
                           modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
@@ -530,6 +546,12 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     }
     switch launchSpecResolver(profileID, explicitModel) {
     case .success(let spec):
+      // Close the chain: the resolver closure's shape is
+      // `(profileID, explicitModel)` and is an existing test seam, so the
+      // backend is stamped onto the returned spec here rather than threaded
+      // through it. Without this the XPC value was recorded and then dropped.
+      var spec = spec
+      spec.chatBackend = requestedChatBackend
       return spec
     case .failure(let err):
       // #477 F1: the resolver/guardrail prose (sizing, path-by-path trace)

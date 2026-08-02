@@ -328,6 +328,17 @@ public enum PieControlLauncher {
     public var pieBinary: URL
     public var wasmURL: URL
     public var manifestURL: URL
+    /// Which backend serves chat for THIS launch.
+    ///
+    /// Carried on the spec rather than read from the process environment:
+    /// `launch()` runs inside the launchd-managed helper, so an app-side
+    /// `launchEnvironment` never reaches it and `RATIO_CHAT_BACKEND` could only
+    /// be set with `launchctl setenv` — global, sticky, and invisible to the
+    /// app. As a spec field the choice travels with the start request, so the
+    /// app can flip back under load without touching launchd state.
+    ///
+    /// Defaults to `.daemon`, which keeps every existing construction valid.
+    public var chatBackend: ChatBackend = .daemon
     /// Process env to give the spawned `pie serve`. The launcher
     /// overlays `PIE_HOME` and `PIE_SHMEM_NAME` on top of this; the
     /// caller is responsible for any sanitization (see
@@ -836,13 +847,26 @@ public enum PieControlLauncher {
     // reconnects on demand.
     await session.recordControlWSURL(wsURL)
     let client = PieControlClient(url: wsURL)
+    // §2 sequencing fix. `launch_daemon` is pie's `wasi:http` hosting — the
+    // exact mechanism pie is REMOVING. Calling it unconditionally meant
+    // gateway mode still depended on it, so the "post-HTTP" path could never
+    // actually run post-HTTP. In gateway mode we skip it entirely: the gateway
+    // is then the only HTTP surface, driving pie over the WebSocket control
+    // plane alone.
+    // Spec first; the environment is only a fallback for CLI harnesses that
+    // build a spec directly and have no XPC caller.
+    let backend = spec.chatBackend == .gateway ? .gateway : ChatBackend.fromEnvironment()
     let httpPort: UInt16
     do {
       try await client.connect()
       try await client.authByToken(handshake.token)
-      try await client.installProgram(wasmURL: spec.wasmURL,
-                                      manifestURL: spec.manifestURL,
-                                      forceOverwrite: true)
+      // The chat-apc wasm is only needed by the daemon path; the gateway
+      // installs its own inferlets over its own connection.
+      if backend == .daemon {
+        try await client.installProgram(wasmURL: spec.wasmURL,
+                                        manifestURL: spec.manifestURL,
+                                        forceOverwrite: true)
+      }
       // pass port 0 so pie's inferlet daemon binds an OS-assigned free
       // port at bind time, then learn the actual port from pie's own "Daemon
       // serving HTTP on …" log line. This eliminates the old
@@ -856,14 +880,20 @@ public enum PieControlLauncher {
       // stdout and hung 30s every launch). Snapshot the log cursor BEFORE
       // launch_daemon so the post-launch scan can't pick up a stale port from
       // an earlier same-day launch sharing the rolling daily file.
-      let logCursor = PieControlLauncher.daemonLogCursor(pieHome: spec.pieHome)
-      try await client.launchDaemon(
-        inferlet: spec.inferletNameAtVersion,
-        port: 0,
-        host: spec.daemonBindHost.daemonHost
-      )
-      httpPort = try await session.awaitDaemonPort(
-        baseline: logCursor, timeout: PieControlLauncher.daemonBindTimeout)
+      if backend == .daemon {
+        let logCursor = PieControlLauncher.daemonLogCursor(pieHome: spec.pieHome)
+        try await client.launchDaemon(
+          inferlet: spec.inferletNameAtVersion,
+          port: 0,
+          host: spec.daemonBindHost.daemonHost
+        )
+        httpPort = try await session.awaitDaemonPort(
+          baseline: logCursor, timeout: PieControlLauncher.daemonBindTimeout)
+      } else {
+        // Gateway mode: no daemon, so no daemon port. The gateway's own port
+        // is published below and is what the app will use.
+        httpPort = 0
+      }
       await client.close()
     } catch is CancellationError {
       _ = await session.residentMemoryBytes()
@@ -893,6 +923,39 @@ public enum PieControlLauncher {
         )
       }
       throw LaunchError.clientError(underlying: "\(error)")
+    }
+
+    // A/B switch (phase 5). With RATIO_CHAT_BACKEND=gateway the app must talk
+    // to ratio-gateway, NOT the chat-apc daemon — and because
+    // `HTTPEngineClient` resolves its base URL from `EngineStatus.running(port:)`
+    // (which PieEngineHost publishes from whatever this function returns),
+    // redirecting the app means returning the GATEWAY's port here. Rewriting
+    // <PIE_HOME>/http.port alone would only move test harnesses.
+    //
+    // Default is `.daemon`, so with the flag unset this whole block is skipped
+    // and the launch path is byte-identical to before.
+    if backend == .gateway {
+      // NOT Bundle.main: in production this runs inside RationalHelper.app,
+      // while the gateway is staged in the containing Rational.app. The
+      // nested-bundle walk is the same one chat-apc's wasm already uses.
+      let supervisor = GatewaySupervisor()
+      do {
+        let staged = try InferletResources.gateway()
+        let gatewayPort = try await supervisor.start(
+          spec: GatewaySupervisor.Spec(
+            binary: staged.binary,
+            inferlets: staged.inferlets,
+            pieURL: "ws://\(handshake.address)",
+            pieToken: handshake.token))
+        await session.adoptGateway(supervisor)
+        try? writePortFile(port: gatewayPort, in: spec.pieHome)
+        return (gatewayPort, session)
+      } catch {
+        // Fail loud rather than silently serving the daemon: an operator who
+        // asked for the gateway and got chat-apc would A/B the wrong thing.
+        _ = await session.shutdown(reason: "launch.gateway_failed")
+        throw error
+      }
     }
 
     do {
@@ -1425,6 +1488,15 @@ public actor LaunchedSession {
     if !process.isRunning {
       return .gone(reason: "engine process exited (\(terminationDescription()))")
     }
+    // Third signal: in gateway mode the port the app is pinned to belongs to
+    // ratio-gateway, not pie. A dead gateway with a healthy engine used to
+    // leave EngineStatus `.running` against a dead port forever, because
+    // nothing probed it after startup. Checked BEFORE the engine ping: if the
+    // gateway is gone the app cannot reach anything, so the engine's health is
+    // moot and the restart ladder should fire on the real cause.
+    if let gateway, let reason = await gateway.health() {
+      return .gone(reason: reason)
+    }
     guard let controlWSURL else {
       // Pre-handshake (address not yet recorded): the process is up;
       // defer to the next probe rather than declaring a false death.
@@ -1480,7 +1552,20 @@ public actor LaunchedSession {
     await shutdown(reason: "unspecified")
   }
 
+  /// Ties a supervised `ratio-gateway` to this engine session so teardown is
+  /// a single call — an orphaned gateway would keep a loopback listener bound
+  /// and the next launch would fight it for the port.
+  private var gateway: GatewaySupervisor?
+
+  public func adoptGateway(_ supervisor: GatewaySupervisor) {
+    gateway = supervisor
+  }
+
   public func shutdown(reason: String) async -> EngineShutdownResult {
+    if let gateway {
+      await gateway.shutdown(reason: reason)
+      self.gateway = nil
+    }
     guard !shutdownDone else {
       return process.isRunning
         ? .unreaped("shutdown was already requested but pid \(process.processIdentifier) is still running")

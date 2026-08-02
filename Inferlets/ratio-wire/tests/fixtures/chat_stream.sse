@@ -1,0 +1,32 @@
+data: {"event":"model_ready"}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":"Hi"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":" there"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":"!"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":" How"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":" can"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":" I"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":" assist"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":" you"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":" today"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{"content":"?"}}]}
+
+data: {"id":"chatcmpl-18c7cb35d61e2118000000000000014d","object":"chat.completion.chunk","created":1785619209,"model":"qwen","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"event":"generation_metrics","output_tokens":10,"elapsed_s":0.330099084,"tokens_per_sec":30.29393441152354}
+
+data: {"event":"usage","prompt_tokens":10,"completion_tokens":10,"total_tokens":20,"context_window":32768}
+
+data: [DONE]
+

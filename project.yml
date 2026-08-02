@@ -97,6 +97,37 @@ targets:
     # the plist has to be sealed into the bundle's CodeResources, else
     # the outer codesign rejects "resource added that did not exist at
     # signing" and SMAppService refuses an unsealed agent plist.
+      # Stage ratio-gateway + the inferlet wasms. Pre-CodeSign for the same
+      # reason as the engine: a resource added after signing makes
+      # notarization reject the bundle. The script signs the binary with its
+      # own (network-only) entitlements; the app target's
+      # --preserve-metadata=...,entitlements,... keeps the outer sign from
+      # stripping them.
+      - name: Build ratio-gateway
+        script: |
+          set -euo pipefail
+          "${SRCROOT}/Scripts/build-gateway.sh"
+        # Every staged artifact must be an output, else Xcode's dependency
+        # analysis skips the phase once ratio-gateway exists and happily ships
+        # a stale chat.wasm. Inputs cover the Rust sources that produce them.
+        inputFiles:
+          - $(SRCROOT)/Inferlets/chat/src/lib.rs
+          - $(SRCROOT)/Inferlets/chat/Pie.toml
+          - $(SRCROOT)/Inferlets/echo/src/lib.rs
+          - $(SRCROOT)/Inferlets/echo/Pie.toml
+          - $(SRCROOT)/Inferlets/gen-core/src/lib.rs
+          - $(SRCROOT)/Inferlets/ratio-wire/src/lib.rs
+          - $(SRCROOT)/Gateway/ratio-gateway/src/main.rs
+          - $(SRCROOT)/Gateway/ratio-gateway/src/chat.rs
+          - $(SRCROOT)/Gateway/ratio-gateway/src/routes.rs
+          - $(SRCROOT)/Gateway/ratio-gateway/src/engine.rs
+          - $(SRCROOT)/Scripts/build-gateway.sh
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gateway/ratio-gateway
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gateway/inferlets/chat.wasm
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gateway/inferlets/chat.Pie.toml
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gateway/inferlets/echo.wasm
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/gateway/inferlets/echo.Pie.toml
       - name: Stage Helper LaunchAgent plist
         script: |
           set -euo pipefail

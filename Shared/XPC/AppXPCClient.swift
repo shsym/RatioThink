@@ -597,6 +597,29 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
+  /// Shared reply handling for both start paths (with and without an explicit
+  /// backend). Contract (PieHelperXPC): exactly one of
+  /// (successData=EnginePort, errorData=EngineError) is non-nil. The port is
+  /// discarded — callers rely on the engine-status poll for the live
+  /// `.running` signal; this only needs to surface a refusal. A wire-contract
+  /// violation decodes to EngineError(.wireContractViolation).
+  private static func handleStartReply(
+    _ successData: Data?,
+    _ errorData: Data?,
+    _ resumeOnce: (Result<Void, Error>) -> Void
+  ) {
+    do {
+      switch try PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      ) {
+      case .success: resumeOnce(.success(()))
+      case .failure(let engineError): resumeOnce(.failure(engineError))
+      }
+    } catch {
+      resumeOnce(.failure(error))
+    }
+  }
+
   private func startEngine(profileID: String,
                            modelOverride: String?,
                            on connection: NSXPCConnection) async throws {
@@ -633,6 +656,22 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
       }
       guard let api = proxy as? PieHelperXPC else {
         resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
+        return
+      }
+      // The backend choice is resolved HERE, in the app process, and sent
+      // across. `ChatBackend.fromEnvironment()` in the helper would read the
+      // launchd environment — global, sticky, and not settable from an app-side
+      // `launchEnvironment`. Resolving it app-side is the whole point of
+      // carrying it over XPC.
+      //
+      // Only taken when explicitly opting in: with the flag unset this is
+      // `.daemon` and the original call runs unchanged, so the default path
+      // exercises no new XPC surface.
+      let backend = ChatBackend.fromEnvironment()
+      if backend != .daemon, let startWithBackend = api.startEngineWithBackend {
+        startWithBackend(profileID, modelOverride, backend.rawValue) { successData, errorData in
+          Self.handleStartReply(successData, errorData, resumeOnce)
+        }
         return
       }
       api.startEngine(profileID: profileID, modelOverride: modelOverride) { successData, errorData in

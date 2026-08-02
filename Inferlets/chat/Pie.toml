@@ -1,0 +1,16 @@
+[package]
+name = "chat"
+version = "0.1.0"
+description = "OpenAI-shaped chat generation over gen-core"
+authors = ["RatioThink"]
+
+[runtime]
+core = "^0.2.0"
+
+# Descriptive only — pie does not enforce these. The real contract is
+# gen_core::ChatRequest, deserialized from RunInput.request.
+[parameters]
+model = {type = "string", description = "engine-registered model id"}
+max_tokens = {type = "int", optional = true, description = "default 1024"}
+temperature = {type = "float", optional = true, description = "default 0.7"}
+top_p = {type = "float", optional = true, description = "default 1.0"}

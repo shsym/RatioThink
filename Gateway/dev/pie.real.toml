@@ -1,0 +1,19 @@
+[server]
+host = "127.0.0.1"
+port = 0
+[auth]
+enabled = false
+[telemetry]
+enabled = false
+[runtime]
+allow_fs = false
+allow_network = true
+[[model]]
+name = "qwen"
+hf_repo = "/Users/guojun/.cache/huggingface/hub/models--bartowski--Qwen2.5-7B-Instruct-GGUF/snapshots/8911e8a47f92bac19d6f5c64a2e2095bd2f7d031/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+[model.scheduler]
+batch_policy = "adaptive"
+request_timeout_secs = 120
+[model.driver]
+type = "portable"
+device = ["metal"]
