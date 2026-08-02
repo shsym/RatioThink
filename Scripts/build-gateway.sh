@@ -40,7 +40,24 @@ if ! rustup target list --installed 2>/dev/null | grep -q wasm32-wasip2; then
   echo "error: rustup target add wasm32-wasip2" >&2
   exit 1
 fi
-for inf in chat echo; do
+
+# DERIVED, not hardcoded. This loop read `chat echo` while the repo had grown
+# `tot` and `bestofn`, so the shipped bundle registered neither and both routes
+# 404'd in the real app — with every dev gate green, because the dev driver
+# staged its own directory.
+#
+# The discriminator is a `[ratio]` table in Pie.toml, which is exactly what
+# makes a crate a gateway-registered inferlet. It also excludes `chat-apc`,
+# which ships a Pie.toml but is the legacy monolith.
+INFERLETS=()
+for manifest in "$REPO_ROOT"/Inferlets/*/Pie.toml; do
+  grep -q '^\[ratio\]' "$manifest" || continue
+  INFERLETS+=( "$(basename "$(dirname "$manifest")")" )
+done
+[[ ${#INFERLETS[@]} -gt 0 ]] || { echo "error: no inferlets declare [ratio]" >&2; exit 1; }
+echo "    staging: ${INFERLETS[*]}"
+
+for inf in "${INFERLETS[@]}"; do
   ( cd "$REPO_ROOT/Inferlets/$inf" && cargo build --release --locked --target wasm32-wasip2 )
 done
 
@@ -50,9 +67,17 @@ DEST_DIR="$DEST_ROOT/gateway"
 mkdir -p "$DEST_DIR/inferlets"
 
 cp -f "$BUILT_BIN" "$DEST_DIR/ratio-gateway"
-for inf in chat echo; do
+for inf in "${INFERLETS[@]}"; do
   cp -f "$REPO_ROOT/Inferlets/$inf/target/wasm32-wasip2/release/$inf.wasm" "$DEST_DIR/inferlets/$inf.wasm"
   cp -f "$REPO_ROOT/Inferlets/$inf/Pie.toml" "$DEST_DIR/inferlets/$inf.Pie.toml"
+done
+
+# The gateway refuses to start on a malformed directory, but a bundle that is
+# merely INCOMPLETE starts fine and 404s the missing routes. Fail the build
+# instead, naming what is absent.
+for inf in "${INFERLETS[@]}"; do
+  [[ -f "$DEST_DIR/inferlets/$inf.wasm" && -f "$DEST_DIR/inferlets/$inf.Pie.toml" ]] \
+    || { echo "error: $inf did not stage into the bundle" >&2; exit 1; }
 done
 
 # Same identity-resolution ladder as build-pie-engine.sh: the expanded value

@@ -105,6 +105,39 @@ pub async fn chat_completions(
         Err(resp) => return resp,
     };
 
+    // DISPATCH BY PROTOCOL CLASS, before reading a single chat-specific field.
+    //
+    // The app posts streaming ToT and Best-of-N here, not to /v1/inferlet
+    // (`HTTPEngineClient.dispatchInferlet:193-196`), so this endpoint receives
+    // tree routes and must hand them to the tree driver. Without it, `prepare`
+    // resolves the route, the chat driver takes over, and its deferred-commit
+    // loop waits for an `Event::Ready` a tree guest never sends — so the guest
+    // runs an ENTIRE search, returns, and the driver reports
+    // "returned before ready" as a 500. Measured at 14s of wasted generation
+    // per request.
+    //
+    // This was masked until `TreeV1::implemented()` became true: before that,
+    // `prepare` refused tree routes here with an honest 501. Making the tree
+    // driver real is what opened the path, and no gate caught it because every
+    // gate posted to /v1/inferlet — the endpoint the app does NOT use for these.
+    //
+    // With both endpoints dispatching by class, which URL a caller picks stops
+    // being able to change behaviour.
+    match entry.protocol {
+        crate::registry::Protocol::ChatV1 => {}
+        crate::registry::Protocol::TreeV1 => {
+            return crate::tree::dispatch(st, entry.route.clone(), entry.program.clone(), raw)
+                .await;
+        }
+        crate::registry::Protocol::JsonUnaryV1 => {
+            return api_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "protocol_not_implemented",
+                "json-unary-v1 has no driver",
+            );
+        }
+    }
+
     // Only routing/transport fields are read here. Everything else — roles,
     // sampling bounds, cue mode — belongs to gen-core.
     let model = raw.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();

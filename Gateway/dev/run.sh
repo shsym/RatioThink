@@ -11,6 +11,7 @@
 #   ./Gateway/dev/run.sh crossmode        B2 gate: chat -> ToT -> chat KV reuse
 #   ./Gateway/dev/run.sh bon              C gate: chat -> BoN -> pick -> commit -> chat
 #   ./Gateway/dev/run.sh view-commit      the view's commit body, end to end
+#   ./Gateway/dev/run.sh endpoints        parity: the app's URL vs the gates' URL
 #   ./Gateway/dev/run.sh ab               A/B vs the chat-apc oracle (needs both up)
 #   ./Gateway/dev/run.sh oracle           start chat-apc on :8081 for the A/B
 set -euo pipefail
@@ -39,16 +40,30 @@ stage() {
   done
 }
 
+# DERIVED the same way Scripts/build-gateway.sh derives it, so the dev stack and
+# the shipped bundle cannot register different sets. They did: this list read
+# `chat echo tot bestofn` while the bundle script read `chat echo`, so every
+# gate was green against routes the real app would 404.
+inferlets() {
+  local m
+  for m in "$REPO"/Inferlets/*/Pie.toml; do
+    grep -q '^\[ratio\]' "$m" || continue
+    basename "$(dirname "$m")"
+  done
+}
+
 cmd_build() {
   need_cargo
   rustup target list --installed | grep -q wasm32-wasip2 || rustup target add wasm32-wasip2
-  echo "==> inferlets → wasm"
-  for i in chat echo tot bestofn; do
+  local list; list=($(inferlets))
+  echo "==> inferlets → wasm: ${list[*]}"
+  local i
+  for i in "${list[@]}"; do
     ( cd "$REPO/Inferlets/$i" && cargo build --release --target wasm32-wasip2 )
   done
   echo "==> gateway"
   ( cd "$REPO/Gateway" && cargo build --release )
-  stage chat echo tot bestofn
+  stage "${list[@]}"
   echo "✅ built → $INFERLET_DIR"
 }
 
@@ -274,6 +289,13 @@ cmd_view_commit() {
   echo "✅ view-commit gate passed: the next chat turn reused $reused tokens"
 }
 
+# Endpoint parity. Every other gate posts to /v1/inferlet; the app posts
+# streaming ToT/Best-of-N — and Best-of-N release — to /v1/chat/completions.
+# That divergence hid a total ToT/Best-of-N outage behind four green gates.
+cmd_endpoints() {
+  python3 "$REPO/Gateway/dev/endpoints.py"
+}
+
 cmd_test() {
   need_cargo
   echo "==> ratio-wire (golden + forward-compat)"; ( cd "$REPO/Inferlets/ratio-wire" && cargo test )
@@ -351,6 +373,7 @@ case "${1:-}" in
   crossmode)   cmd_crossmode "${2:-}" ;;
   bon)         cmd_bon "${2:-}" ;;
   view-commit) cmd_view_commit "${2:-}" ;;
+  endpoints)   cmd_endpoints ;;
   test)        cmd_test ;;
   conformance) cmd_conformance ;;
   reload-test) cmd_reload_test ;;

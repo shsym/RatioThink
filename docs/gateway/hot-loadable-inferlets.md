@@ -338,6 +338,39 @@ be refused.
   `round_id`, so the app's flat cross-round name list would have had most of it
   refused while the ack looked like a benign short release.
 
+### Auditing the other gates for the same blind spot
+
+The C-gate lesson — *a gate that builds its own request can only test the half
+it models* — was applied to the other three. Both findings were live, and
+together they meant ToT and Best-of-N were **completely non-functional in the
+shipped app** while all four gates were green.
+
+**The app does not use the endpoint the gates use.**
+`HTTPEngineClient.dispatchInferlet` sends streaming ToT and Best-of-N, and
+Best-of-N release, to `/v1/chat/completions`; every gate posted to
+`/v1/inferlet`. `chat_completions` resolved the route and then drove it with the
+CHAT protocol, so a tree guest ran an entire search, returned, and the driver
+reported `no_output` / "returned before ready" as a 500 — measured at 14 seconds
+of generation thrown away per request. This was masked until
+`TreeV1::implemented()` became true in B2: before that, `prepare` refused tree
+routes here with an honest 501. Making the tree driver real is what opened it.
+Both endpoints now dispatch by protocol class, so which URL a caller picks
+cannot change behaviour.
+
+**The bundle shipped a different inferlet set than the dev stack.**
+`Scripts/build-gateway.sh` looped over a hardcoded `chat echo` while the repo
+had grown `tot` and `bestofn`, so the shipped app registered neither and both
+routes would 404 — with every gate green, because the dev driver staged its own
+directory. Both scripts now DERIVE the list from which `Pie.toml` files declare
+a `[ratio]` table (which also excludes the legacy `chat-apc` monolith), and the
+bundle build fails if a declared inferlet does not stage.
+
+**`run.sh endpoints`** is the new gate. It takes its routes from the SERVER's
+own `/v1/inferlets`, so a newly registered inferlet is covered without editing
+it, and it transcribes the CLIENT's routing rule as data — then asserts the two
+agree. Verified as a negative control: reverting the protocol dispatch makes it
+fail with `error:no_output` on exactly the routes that were broken.
+
 ### Two defects found after the milestone, and why the gate missed them
 
 **P1 — think-more could not resume.** `sendBestOfN` minted a fresh
