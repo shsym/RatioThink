@@ -338,12 +338,41 @@ be refused.
   `round_id`, so the app's flat cross-round name list would have had most of it
   refused while the ack looked like a benign short release.
 
-*Scope:* the guest and gateway halves are complete and gated. On the Swift side
-the round now mints and persists its scope, the request bodies carry `round_id`
-and the commit shape exists, and the release sweep is per-round — but the view
-still calls release-on-commit rather than the new commit operation, so the app
-does not yet write a `conv/` boundary on a pick. That last wiring is a view
-change, tracked separately.
+### The view-side commit
+
+Wired. A level-2 pick now runs the commit operation instead of a bare release,
+so accepting an answer writes its `conv/` boundary. `./Gateway/dev/run.sh
+view-commit` replays the exact body `ChatScaffoldView` builds and asserts the
+next chat turn reuses it: **30 of 42 tokens**, with the app's system prompt in
+the digested history.
+
+**The ordering is the whole trick, and it is easy to get backwards.** The commit
+is PREPARED before the answer is written locally and DISPATCHED after, because
+two invariants pull opposite ways:
+
+* the commit's `messages` must be the canonical history WITHOUT the accepted
+  answer — the guest appends `assistant(answer)` itself, and a history already
+  containing it names a boundary with the answer twice, which nothing asks for.
+  An assistant row with empty content is excluded from request history
+  (`excludesFromRequestHistory`), so the body must be built while the row is
+  still empty;
+* nothing may be deleted unless the local save succeeded — the existing rule
+  that stops a rejected commit from discarding its recovery state.
+
+A test asserts the wrong order *does* duplicate the answer, so the invariant has
+teeth rather than being a comment.
+
+Two failure paths that would otherwise leak: a commit that throws, and one that
+returns `boundary_saved: false`. Both fall back to a plain guarded release —
+once the answer is committed the round drops out of the abandon sweep, so
+nothing else would ever free it. The boundary is lost (costing the next turn a
+re-prefill); the pages come back.
+
+Options are assembled once by `bestOfNSendOptions(for:)` and shared by the round
+and the commit. That is not tidiness: the boundary name hashes `transcriptTurns`,
+which prepends `systemPromptOverride`, so a commit built from separately
+assembled options could name a boundary the next turn never asks for — with no
+error, just a permanently cold turn.
 
 Splitting B is deliberate: it previously combined hot loading, a new process
 protocol, ToT extraction and cross-mode caching in one step, which makes failures

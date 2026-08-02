@@ -1047,6 +1047,143 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
+  // MARK: Commit (§6.2)
+
+  /// A prepared Best-of-N commit, captured BEFORE the answer is written
+  /// locally.
+  ///
+  /// The two-phase shape is forced by two invariants that pull in opposite
+  /// directions:
+  ///
+  /// * The commit's `messages` must be the canonical history WITHOUT the
+  ///   accepted answer — the guest appends `assistant(answer)` itself, and a
+  ///   history that already contains it would name a boundary with the answer
+  ///   twice, which nothing ever asks for. An assistant row with empty content
+  ///   is excluded from history (`excludesFromRequestHistory`), so the request
+  ///   must be built while `message.content` is still empty.
+  /// * Nothing may be deleted unless the local save succeeded — the existing
+  ///   rule that keeps a rejected commit from discarding its recovery state.
+  ///
+  /// So: prepare (pre-commit), save, then dispatch.
+  public struct PreparedBestOfNCommit: Sendable {
+    fileprivate let request: InferletRequest
+    fileprivate let fallbackRelease: InferletRequest?
+
+    /// The encoded body, for the tests that pin the ordering invariant. The
+    /// bug this guards against is a body that LOOKS right and names a boundary
+    /// nothing asks for, so it can only be caught by reading the JSON.
+    var requestForTesting: InferletRequest { request }
+  }
+
+  /// Build the commit for `round`'s accepted `answer`. Call BEFORE committing
+  /// the answer into the message.
+  ///
+  /// Returns nil when the round carries no `roundID` — a round persisted before
+  /// the scope existed cannot authorize its own deletes, and the guest would
+  /// refuse every name. Those callers fall back to the old behaviour (commit
+  /// the text locally, free nothing) rather than issuing a request that would
+  /// be refused wholesale.
+  public static func prepareBestOfNCommit(
+    chat: Chat,
+    options: ChatSendRequestOptions,
+    round: BestOfNRound,
+    answer: String
+  ) -> PreparedBestOfNCommit? {
+    guard let roundID = round.roundID, !roundID.isEmpty,
+          let chosen = round.chosen
+    else { return nil }
+    let messages = transcriptTurns(chat: chat, options: options)
+    let input = BestOfNCommitInput(
+      model: options.modelID,
+      boundary: Self.boundaryDirective(chat: chat, turnCount: messages.count, options: options),
+      roundID: roundID,
+      messages: messages,
+      commit: BestOfNCommitInput.Commit(
+        snapshotName: chosen.snapshotName,
+        answer: answer,
+        release: round.candidates.map(\.snapshotName)))
+    guard let data = try? JSONEncoder().encode(input) else { return nil }
+    return PreparedBestOfNCommit(
+      request: InferletRequest(
+        inferlet: "best-of-n", input: data, messages: nil, stream: false),
+      // If the commit fails, the KV must still be freed: once the answer is
+      // committed the round drops out of the abandon sweep
+      // (`uncommittedRounds` skips messages with content), so nothing else
+      // would ever free it. The boundary is lost — costing the next turn a
+      // re-prefill — but the pages come back.
+      fallbackRelease: makeBestOfNReleaseRequest(
+        modelID: options.modelID, roundID: roundID,
+        names: round.candidates.map(\.snapshotName)))
+  }
+
+  /// Dispatch a prepared commit. Call only AFTER the answer is durably saved.
+  ///
+  /// Fire-and-forget like the release it replaces: the answer is already
+  /// persisted and visible, so the user must not wait on KV bookkeeping.
+  public func dispatchBestOfNCommit(_ prepared: PreparedBestOfNCommit, engine: EngineClient) {
+    Task { @MainActor in
+      do {
+        var frames: [Data] = []
+        for try await frame in engine.dispatchInferlet(prepared.request) { frames.append(frame) }
+        let ack = try Self.decodeCommitAck(frames: frames)
+        guard let ack else {
+          Log.engine.error("ChatSendController: best-of-n commit returned no ack")
+          Self.dispatchFallbackRelease(prepared, engine: engine)
+          return
+        }
+        if !ack.boundarySaved {
+          // The guest refused to delete anything, by design — so the round's
+          // KV is still live and still ours to free.
+          Log.engine.error(
+            "ChatSendController: best-of-n commit did not save the boundary; releasing instead")
+          Self.dispatchFallbackRelease(prepared, engine: engine)
+          return
+        }
+        if let message = Self.shortCommitLog(ack) {
+          Log.engine.notice("ChatSendController: \(message, privacy: .public)")
+        }
+      } catch {
+        let detail = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+        Log.engine.error(
+          "ChatSendController: best-of-n commit failed: \(detail, privacy: .public)")
+        Self.dispatchFallbackRelease(prepared, engine: engine)
+      }
+    }
+  }
+
+  private static func dispatchFallbackRelease(
+    _ prepared: PreparedBestOfNCommit, engine: EngineClient
+  ) {
+    guard let request = prepared.fallbackRelease else { return }
+    Task { @MainActor in
+      do {
+        for try await _ in engine.dispatchInferlet(request) {}
+      } catch {
+        Log.engine.error("ChatSendController: best-of-n fallback release failed")
+      }
+    }
+  }
+
+  /// Decode the unary commit ack. Same contract as `decodeReleaseAck`: a 2xx
+  /// body that is not a decodable ack THROWS rather than reading as success —
+  /// here that matters more, because "success" would mean the round's KV was
+  /// freed.
+  nonisolated static func decodeCommitAck(frames: [Data]) throws -> BestOfNCommitAck? {
+    var ack: BestOfNCommitAck?
+    for frame in frames {
+      ack = try JSONDecoder().decode(BestOfNCommitAck.self, from: frame)
+    }
+    return ack
+  }
+
+  /// One line, only when it says something. A refusal is always worth logging:
+  /// it means the client asked to free something it could not prove it owned.
+  nonisolated static func shortCommitLog(_ ack: BestOfNCommitAck) -> String? {
+    guard ack.refused > 0 || ack.released < ack.requested else { return nil }
+    return "best-of-n commit saved the boundary and freed \(ack.released)/\(ack.requested) "
+      + "snapshots (\(ack.absent) already absent, \(ack.refused) refused)"
+  }
+
   /// Build the chat-completions dispatch envelope for a Best-of-N
   /// snapshot-release request (#690): a `release` list, no messages, no
   /// generation. `modelID` is omitted when nil so the engine resolves its
@@ -1358,6 +1495,46 @@ struct BestOfNReleaseAck: Decodable, Equatable {
   let requested: Int
   let released: Int
   let absent: Int
+  /// Names the guest refused to delete because they were not provably this
+  /// round's. Distinct from `absent`, which is benign — a refusal means the
+  /// client asked to free something it could not prove it owned.
+  /// Defaulted so an older engine's ack still decodes.
+  let refused: Int
+
+  private enum CodingKeys: String, CodingKey {
+    case requested, released, absent, refused
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    requested = try c.decode(Int.self, forKey: .requested)
+    released = try c.decode(Int.self, forKey: .released)
+    absent = try c.decode(Int.self, forKey: .absent)
+    refused = try c.decodeIfPresent(Int.self, forKey: .refused) ?? 0
+  }
+
+  init(requested: Int, released: Int, absent: Int, refused: Int = 0) {
+    self.requested = requested
+    self.released = released
+    self.absent = absent
+    self.refused = refused
+  }
+}
+
+/// The §6.2 commit ack. `boundarySaved` is the load-bearing field: the guest
+/// deletes NOTHING unless it is true, so a false here means the round's KV is
+/// still live and still the client's to free.
+struct BestOfNCommitAck: Decodable, Equatable {
+  let boundarySaved: Bool
+  let requested: Int
+  let released: Int
+  let absent: Int
+  let refused: Int
+
+  private enum CodingKeys: String, CodingKey {
+    case boundarySaved = "boundary_saved"
+    case requested, released, absent, refused
+  }
 }
 
 /// Failure constructing a tree-of-thought send.

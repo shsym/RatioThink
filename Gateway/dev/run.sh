@@ -10,6 +10,7 @@
 #   ./Gateway/dev/run.sh reload-test      B1 gate: hot-reload echo (needs `serve`)
 #   ./Gateway/dev/run.sh crossmode        B2 gate: chat -> ToT -> chat KV reuse
 #   ./Gateway/dev/run.sh bon              C gate: chat -> BoN -> pick -> commit -> chat
+#   ./Gateway/dev/run.sh view-commit      the view's commit body, end to end
 #   ./Gateway/dev/run.sh ab               A/B vs the chat-apc oracle (needs both up)
 #   ./Gateway/dev/run.sh oracle           start chat-apc on :8081 for the A/B
 set -euo pipefail
@@ -247,6 +248,26 @@ cmd_bon() {
   echo "✅ C gate passed: round 1 reused $bon_reused (entry), chat after commit reused $chat_reused (exit)"
 }
 
+# The view's commit path: replay the EXACT body ChatScaffoldView now builds.
+# The Swift tests prove the body is assembled correctly (including the ordering
+# invariant — messages must NOT contain the accepted answer, since the guest
+# appends it); this proves the guest accepts that shape and that the boundary it
+# names is the one the next chat turn actually asks for.
+cmd_view_commit() {
+  local key="${1:-view-commit-$$}"
+  local log="${GATEWAY_LOG:-/tmp/view.log}"
+  local before
+  before=$(wc -l < "$log" 2>/dev/null || echo 0)
+  python3 "$REPO/Gateway/dev/view-commit.py" "$key" || return 1
+  local slice reused
+  slice=$(tail -n +$((before + 1)) "$log" | sed $'s/\033\[[0-9;]*m//g' | grep -E "kv reuse" || true)
+  echo "$slice"
+  reused=$(echo "$slice" | grep "chat: kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
+  [[ -n "$reused" && "$reused" -gt 0 ]] || {
+    echo "❌ the chat turn after the commit reused nothing — the commit named a boundary it does not ask for"; return 1; }
+  echo "✅ view-commit gate passed: the next chat turn reused $reused tokens"
+}
+
 cmd_test() {
   need_cargo
   echo "==> ratio-wire (golden + forward-compat)"; ( cd "$REPO/Inferlets/ratio-wire" && cargo test )
@@ -323,6 +344,7 @@ case "${1:-}" in
   tot)         cmd_tot "${2:-}" ;;
   crossmode)   cmd_crossmode "${2:-}" ;;
   bon)         cmd_bon "${2:-}" ;;
+  view-commit) cmd_view_commit "${2:-}" ;;
   test)        cmd_test ;;
   conformance) cmd_conformance ;;
   reload-test) cmd_reload_test ;;
