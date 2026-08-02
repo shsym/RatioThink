@@ -334,6 +334,11 @@ public struct ChatRequest: Codable, Equatable, Sendable {
   /// #522 prefix-cache directive. `nil` → no `cache` key on the wire
   /// (reuse disabled, byte-identical to pre-#522). Nested-encoded.
   public let cache: ChatCacheDirective?
+  /// Conversation identity for the mode-neutral KV boundary. Same shape as
+  /// `cache`, but sent on EVERY generative request — the gateway cannot derive
+  /// conversation identity from `messages`, so ToT and Best-of-N could not name
+  /// a boundary without it.
+  public let boundary: ChatCacheDirective?
   /// Optional OpenAI `response_format` (#572). `nil` → no key on the wire
   /// (unconstrained). `.jsonObject` → JSON-grammar-constrained decoding.
   public let responseFormat: ChatResponseFormat?
@@ -344,6 +349,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
               stream: Bool = true,
               speculation: ChatSpeculation? = nil,
               cache: ChatCacheDirective? = nil,
+              boundary: ChatCacheDirective? = nil,
               responseFormat: ChatResponseFormat? = nil) {
     self.model = model
     self.messages = messages
@@ -351,6 +357,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     self.stream = stream
     self.speculation = speculation
     self.cache = cache
+    self.boundary = boundary
     self.responseFormat = responseFormat
   }
 
@@ -368,6 +375,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     case maxTokens = "max_tokens"
     case speculation
     case cache
+    case boundary
     case responseFormat = "response_format"
   }
 
@@ -381,6 +389,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     try c.encode(sampling.maxTokens, forKey: .maxTokens)
     try c.encodeIfPresent(speculation, forKey: .speculation)
     try c.encodeIfPresent(cache, forKey: .cache)
+    try c.encodeIfPresent(boundary, forKey: .boundary)
     try c.encodeIfPresent(responseFormat, forKey: .responseFormat)
   }
 
@@ -396,6 +405,7 @@ public struct ChatRequest: Codable, Equatable, Sendable {
     )
     self.speculation = try c.decodeIfPresent(ChatSpeculation.self, forKey: .speculation)
     self.cache = try c.decodeIfPresent(ChatCacheDirective.self, forKey: .cache)
+    self.boundary = try c.decodeIfPresent(ChatCacheDirective.self, forKey: .boundary)
     self.responseFormat = try c.decodeIfPresent(ChatResponseFormat.self, forKey: .responseFormat)
   }
 }

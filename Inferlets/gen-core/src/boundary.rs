@@ -259,3 +259,35 @@ mod tests {
         assert!(canonical.starts_with(&[1u32, 2, 3]));
     }
 }
+
+#[cfg(test)]
+mod swift_wire_tests {
+    use super::*;
+
+    /// The app sends `ChatCacheDirective` under `boundary`. That type carries
+    /// `policy` and `retention` too, which this side has no use for — so the
+    /// decode must tolerate them rather than fail the request.
+    #[test]
+    fn accepts_the_real_swift_directive() {
+        let from_app = serde_json::json!({
+            "key": "0F1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9",
+            "turn": 4,
+            "compat": "1",
+            "policy": "auto",
+            "retention": { "budget_pages": 1024, "reason": "kv_pressure" }
+        });
+        let d: BoundaryDirective =
+            serde_json::from_value(from_app).expect("must decode the app's directive");
+        assert_eq!(d.key, "0F1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9");
+        assert_eq!(d.compat, "1");
+        assert_eq!(d.turn, 4);
+        assert!(d.enabled, "the app sends no `enabled`; reuse must stay on");
+    }
+
+    /// A request with no directive must degrade to no-reuse, not error.
+    #[test]
+    fn absent_directive_disables_reuse_quietly() {
+        let d = BoundaryDirective::default();
+        assert!(d.key.is_empty(), "an empty key is the no-reuse signal");
+    }
+}

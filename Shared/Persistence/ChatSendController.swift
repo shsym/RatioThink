@@ -697,6 +697,7 @@ public final class ChatSendController: ObservableObject {
       stream: true,
       speculation: wireSpec,
       cache: cache,
+      boundary: cache,
       responseFormat: wireResponseFormat
     )
   }
@@ -736,6 +737,19 @@ public final class ChatSendController: ObservableObject {
     """
   }
 
+  /// The conversation-identity directive every generative request carries.
+  ///
+  /// One helper so chat, tree-of-thought and Best-of-N agree by construction:
+  /// the boundary is content-addressed, so two modes share KV only if they
+  /// present the SAME key and compat for the same conversation.
+  private static func boundaryDirective(chat: Chat, turnCount: Int,
+                                        options: ChatSendRequestOptions) -> ChatCacheDirective {
+    ChatCacheDirective(
+      key: chat.id.uuidString,
+      turn: turnCount,
+      retention: retentionDirective(from: options.kvUsageSnapshot, modelID: options.modelID))
+  }
+
   private static func retentionDirective(from snapshot: KVUsageSnapshot?,
                                          modelID: String) -> ChatCacheRetentionDirective? {
     guard let snapshot,
@@ -759,6 +773,9 @@ public final class ChatSendController: ObservableObject {
   ) -> InferletRequest? {
     let input = ToTRequestInput(
       model: options.modelID,
+      boundary: Self.boundaryDirective(
+        chat: chat, turnCount: transcriptTurns(chat: chat, options: options).count,
+        options: options),
       messages: transcriptTurns(chat: chat, options: options),
       breadth: config.breadth,
       depth: config.depth,
@@ -946,6 +963,9 @@ public final class ChatSendController: ObservableObject {
   ) -> InferletRequest? {
     let input = BestOfNRequestInput(
       model: options.modelID,
+      boundary: Self.boundaryDirective(
+        chat: chat, turnCount: transcriptTurns(chat: chat, options: options).count,
+        options: options),
       messages: transcriptTurns(chat: chat, options: options),
       n: config.n,
       maxTokensPerCandidate: config.maxTokensPerCandidate,
@@ -1184,6 +1204,8 @@ public final class ChatSendController: ObservableObject {
 /// `top_p` come from the shared sampling, the rest from the ToT profile.
 private struct ToTRequestInput: Encodable {
   let model: String
+  /// Conversation identity for the shared KV boundary (see gen-core).
+  let boundary: ChatCacheDirective?
   let messages: [ChatMessage]
   let breadth: Int
   let depth: Int
@@ -1205,6 +1227,8 @@ private struct ToTRequestInput: Encodable {
 /// (`encodeIfPresent`), so the server reads it as a fresh round.
 private struct BestOfNRequestInput: Encodable {
   let model: String
+  /// Conversation identity for the shared KV boundary (see gen-core).
+  let boundary: ChatCacheDirective?
   let messages: [ChatMessage]
   let n: Int
   let maxTokensPerCandidate: Int
