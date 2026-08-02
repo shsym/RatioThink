@@ -9,13 +9,14 @@
 //! chooses. That collapses chat-apc's `handle_streaming` (910 lines) and
 //! `handle_non_streaming` (745 lines), which could previously drift.
 
+pub mod boundary;
 pub mod demux;
 pub mod prompt;
 pub mod schema;
 
 use demux::{Outcome, STARVED_CODE, STARVED_MESSAGE, visible_content};
 use inferlet::{
-    Context, chat,
+    chat,
     inference::SlotOutput,
     model::Model,
     runtime,
@@ -86,12 +87,20 @@ pub async fn run_chat(
     }
     schema::validate_sampling(req).map_err(|(c, m)| GenError::new(c, m))?;
     let model = Model::load(&req.model).map_err(|e| GenError::new("model_load_failed", e))?;
-    // Classify over-capacity distinctly: the app's retry ladder branches on
-    // `server_busy` (503 + Retry-After), and a generic code changes recovery.
-    let mut ctx = Context::new(&model).map_err(|e| GenError::new(classify_engine_error(&e), e))?;
 
-    prompt::fill_context(&mut ctx, &model, &req.messages, req.cue_mode())
-        .map_err(|(code, message)| GenError::new(code, message))?;
+    // §6.1: keep the canonical (cue-free) context, generate on a FORK of it,
+    // and save from the untouched original. Reconstructing the boundary after
+    // generation risks folding cue/reasoning tokens into it.
+    let directive = req.boundary.clone().unwrap_or_default();
+    let canonical =
+        boundary::open_canonical(&model, &req.model, &directive, &req.messages)?;
+    let mut ctx = canonical
+        .ctx
+        .fork()
+        .map_err(|e| GenError::new(classify_engine_error(&e), e))?;
+    // The cue is mode-specific, so it goes on the fork — never into the shared
+    // boundary, or ToT and chat could never agree on a name.
+    ctx.append(&prompt::generation_cue(&model, req.cue_mode()));
 
     // PARITY: read BEFORE the generator runs. `Generator::next` takes the
     // buffer, so after the first step this expression yields a different
@@ -260,6 +269,12 @@ pub async fn run_chat(
         context_window,
     });
 
+    // ORDERING: complete the save BEFORE the caller emits its terminal event,
+    // or the next request can race it and miss.
+    if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) && !content.is_empty() {
+        boundary::save_boundary(&canonical, &model, &req.model, &directive, &content).await?;
+    }
+
     Ok(GenResult {
         content,
         reasoning: (!reasoning_streamed.is_empty()).then_some(reasoning_streamed),
@@ -268,6 +283,8 @@ pub async fn run_chat(
         prompt_tokens,
         completion_tokens: usage_completion,
         context_window,
+        boundary_found: canonical.outcome.found,
+        reused_tokens: canonical.outcome.reused_tokens as u32,
     })
 }
 

@@ -281,6 +281,14 @@ async fn buffered_response(
             }
             Ok(ProcessEvent::Return(r)) => {
                 result = serde_json::from_str::<GenResult>(&r).ok();
+                if let Some(g) = &result {
+                    tracing::info!(
+                        boundary_found = g.boundary_found,
+                        reused_tokens = g.reused_tokens,
+                        prompt_tokens = g.prompt_tokens,
+                        "kv reuse"
+                    );
+                }
                 break;
             }
             Ok(ProcessEvent::Error(e)) => {

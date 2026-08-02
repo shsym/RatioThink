@@ -193,6 +193,14 @@ pub struct GenResult {
     pub completion_tokens: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// KV reuse diagnostics. `found` alone is not a hit: eviction SUSPENDS
+    /// rather than deletes, so an evicted boundary opens successfully and
+    /// replays. Until pie reports residency, `reused_tokens` is the best
+    /// available signal and a silent replay is still invisible.
+    #[serde(default)]
+    pub boundary_found: bool,
+    #[serde(default)]
+    pub reused_tokens: u32,
 }
 
 /// Sink for generation events. Infallible by construction: `session::send`

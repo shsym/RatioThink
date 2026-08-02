@@ -96,6 +96,11 @@ pub struct ChatRequest {
     /// Same: accepted, warned, deferred.
     #[serde(default)]
     pub cache: Option<serde_json::Value>,
+    /// Conversation identity + caching policy. Client-supplied: the gateway
+    /// cannot derive conversation identity from `messages`, so this must ride
+    /// the request. Absent → no reuse, which is the pre-boundary behaviour.
+    #[serde(default)]
+    pub boundary: Option<crate::boundary::BoundaryDirective>,
 }
 
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
