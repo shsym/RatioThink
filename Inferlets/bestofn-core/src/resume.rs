@@ -52,8 +52,18 @@ pub enum ResumeKind {
 
 pub struct ResumeBase {
     pub ctx: Context,
-    /// Canonical tokens of the conversation prefix, for the next round's
-    /// candidate names.
+    /// The COMPLETE token sequence `ctx` holds — conversation prefix +
+    /// `assistant(picked_text)` + the deepen turn.
+    ///
+    /// This is what the next round's candidate names digest over, and getting
+    /// it wrong is a silent wrong-KV bug rather than a miss. An earlier version
+    /// returned only the conversation prefix, which made a level-2 name a
+    /// function of `(answer)` alone: two continuations of the same conversation
+    /// that differed only in WHICH candidate was picked, or in the user's
+    /// think-more comment, produced the SAME name. Combined with treating
+    /// "already exists" as success, that retained the first continuation's KV
+    /// and served it under the second's text — exactly the failure
+    /// content-addressing was introduced to prevent.
     pub tokens: Vec<u32>,
     pub kind: ResumeKind,
     pub deleted: usize,
@@ -115,11 +125,17 @@ pub async fn build(
         GenError::new("snapshot_not_in_round", msg).with_param("resume_from")
     })?;
 
-    // The canonical tokens the pick's digest was computed over. Built directly
-    // rather than through `open_canonical`: on the warm path we never use its
-    // context, and materializing a second full copy of the conversation KV at
-    // the moment of peak residency is exactly the wrong trade.
-    let tokens = prompt::build_prompt_tokens(model, messages, CueMode::None)
+    // TWO token vectors, and they are not interchangeable.
+    //
+    // `verify_tokens` is the base the PICKED candidate was minted under, so it
+    // is what its digest must be recomputed against. Built directly rather than
+    // through `open_canonical`: on the warm path we never use its context, and
+    // materializing a second full copy of the conversation KV at peak residency
+    // is the wrong trade.
+    //
+    // The base THIS round mints under is longer — it also holds the picked
+    // answer and the deepen turn — and is assembled below.
+    let verify_tokens = prompt::build_prompt_tokens(model, messages, CueMode::None)
         .map_err(|(c, m)| GenError::new(c, m))?;
 
     // 1. Free the siblings the user did not pick. Guarded, so a client cannot
@@ -128,30 +144,33 @@ pub async fn build(
     let sib = release_all(&mut ops, unpicked, round_id);
 
     // 2. Warm-start only if the pick is provably the candidate whose text we
-    //    were given.
-    let verified = digest_matches(picked, model_id, &tokens, picked_text);
+    //    were given. Verified against `verify_tokens` — the base it was minted
+    //    under, one hop back.
+    let verified = digest_matches(picked, model_id, &verify_tokens, picked_text);
+    let assistant_tokens = chat::assistant(model, picked_text);
     let (mut ctx, kind) = if verified {
         match Context::open(model, picked) {
             Ok(c) => (c, ResumeKind::Warm),
-            Err(_) => (cold(model, &tokens, picked_text)?, ResumeKind::ColdEvicted),
+            Err(_) => (cold(model, &verify_tokens, &assistant_tokens)?, ResumeKind::ColdEvicted),
         }
     } else {
         eprintln!(
             "[bestofn] resume digest mismatch for {picked:?} — rebuilding from picked_text \
              rather than opening a snapshot we cannot prove is the picked candidate"
         );
-        (cold(model, &tokens, picked_text)?, ResumeKind::ColdMismatch)
+        (cold(model, &verify_tokens, &assistant_tokens)?, ResumeKind::ColdMismatch)
     };
 
     // 3. Deepen turn for the next level, plus any user guidance.
-    let mut deepen = String::from(
-        "Continue from the reply above. Produce a better, complete, standalone answer.",
-    );
-    if let Some(c) = selected_comment.map(str::trim).filter(|c| !c.is_empty()) {
-        deepen.push(' ');
-        deepen.push_str(c);
-    }
-    ctx.append(&chat::user(model, &deepen));
+    let deepen_tokens = chat::user(model, &deepen_turn(selected_comment));
+    ctx.append(&deepen_tokens);
+
+    // The exact sequence `ctx` now holds, on BOTH paths: an opened snapshot is
+    // `verify_tokens ++ assistant(answer)` by construction, which is what the
+    // cold rebuild appends explicitly. This is what the round mints names over.
+    let mut tokens = verify_tokens;
+    tokens.extend_from_slice(&assistant_tokens);
+    tokens.extend_from_slice(&deepen_tokens);
 
     // The base is forked n times for generation and n times again for the
     // candidate snapshots, so an unflushed suffix would replay `picked_text` +
@@ -180,11 +199,30 @@ pub async fn build(
     })
 }
 
+/// The think-more instruction, plus any guidance the user typed.
+///
+/// Split out so the round's names can digest the EXACT bytes appended — a
+/// name that ignored the comment would collide across two continuations that
+/// differ only in what the user asked for.
+fn deepen_turn(selected_comment: Option<&str>) -> String {
+    let mut s = String::from(
+        "Continue from the reply above. Produce a better, complete, standalone answer.",
+    );
+    if let Some(c) = selected_comment.map(str::trim).filter(|c| !c.is_empty()) {
+        s.push(' ');
+        s.push_str(c);
+    }
+    s
+}
+
 /// Rebuild the base from the client's `picked_text` with no snapshot at all.
-fn cold(model: &Model, tokens: &[u32], picked_text: &str) -> Result<Context, GenError> {
+///
+/// Produces the same token sequence an opened snapshot holds, which is what
+/// lets the caller compute `tokens` once for both paths.
+fn cold(model: &Model, prefix: &[u32], assistant_tokens: &[u32]) -> Result<Context, GenError> {
     let mut ctx = Context::new(model).map_err(|e| GenError::new(classify_engine_error(&e), e))?;
-    ctx.append(tokens);
-    ctx.append(&chat::assistant(model, picked_text));
+    ctx.append(prefix);
+    ctx.append(assistant_tokens);
     Ok(ctx)
 }
 
@@ -237,6 +275,55 @@ mod tests {
     fn a_conv_name_never_verifies() {
         let victim = SnapshotName::conv("other", "1", "qwen", &[1]).as_str().to_string();
         assert!(!digest_matches(&victim, "qwen", &[1], "answer"));
+    }
+
+    /// P2: the base a resumed round mints under must cover the WHOLE context,
+    /// not just the conversation prefix.
+    ///
+    /// When it covered only the prefix, a level-2 name was a function of
+    /// `(answer)` alone — so two continuations of the same conversation that
+    /// differed only in which candidate the user picked produced the SAME name.
+    /// Short answers ("7", "3") collide constantly in practice.
+    #[test]
+    fn continuations_differing_only_in_the_pick_get_different_names() {
+        let prefix = vec![1u32, 2, 3];
+        // Two think-more bases: same conversation, different picked candidate.
+        let after_a = [prefix.clone(), vec![100, 101], vec![200]].concat();
+        let after_b = [prefix.clone(), vec![110, 111], vec![200]].concat();
+
+        let same_answer = "7";
+        let a = SnapshotName::bon_candidate("round-1", 2, 0, "qwen", &after_a, same_answer);
+        let b = SnapshotName::bon_candidate("round-1", 2, 0, "qwen", &after_b, same_answer);
+        assert_ne!(a, b, "same round, level, idx and answer — only the pick differs");
+
+        // The broken version digested `prefix` on both, which collided:
+        let broken_a = SnapshotName::bon_candidate("round-1", 2, 0, "qwen", &prefix, same_answer);
+        let broken_b = SnapshotName::bon_candidate("round-1", 2, 0, "qwen", &prefix, same_answer);
+        assert_eq!(broken_a, broken_b, "this is what the bug looked like");
+    }
+
+    /// The user's think-more guidance is part of the context, so it must be
+    /// part of the name.
+    #[test]
+    fn continuations_differing_only_in_the_comment_get_different_names() {
+        let plain = deepen_turn(None);
+        let guided = deepen_turn(Some("Make it shorter."));
+        assert_ne!(plain, guided);
+        // Distinct deepen text tokenizes to distinct tokens, so the bases and
+        // therefore the names differ. Modelled here at the token level, since
+        // tokenizing needs an engine.
+        let base_plain = vec![1u32, 2, 300];
+        let base_guided = vec![1u32, 2, 301];
+        assert_ne!(
+            SnapshotName::bon_candidate("r", 2, 0, "qwen", &base_plain, "7"),
+            SnapshotName::bon_candidate("r", 2, 0, "qwen", &base_guided, "7")
+        );
+    }
+
+    #[test]
+    fn the_deepen_turn_carries_user_guidance() {
+        assert!(deepen_turn(Some("Be brief.")).ends_with("Be brief."));
+        assert_eq!(deepen_turn(Some("   ")), deepen_turn(None), "blank guidance is inert");
     }
 
     /// Every cold path is still a usable round, so a mismatch costs a

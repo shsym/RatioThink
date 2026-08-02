@@ -16,7 +16,7 @@ use gen_core::boundary::{self, BoundaryDirective, OpenOutcome};
 use gen_core::schema::ChatMessage;
 use gen_core::{GenError, classify_engine_error};
 use inferlet::{Context, model::Model};
-use ratio_names::SnapshotName;
+use ratio_names::{Collision, SnapshotName, collision_for};
 use ratio_wire::event::Pick;
 use ratio_wire::{Event, EventSink};
 use serde::{Deserialize, Serialize};
@@ -267,12 +267,31 @@ pub async fn run(
 /// stance directive and its cue, which must never be part of what a resume
 /// continues from.
 async fn save_candidate(model: &Model, base: &Context, answer: &str, name: &str) -> bool {
-    // Content-addressed, so an existing name holds identical KV by
-    // construction. chat-apc had to delete-before-save because its names were
-    // POSITIONAL: the same name could hold a different candidate's KV, and
-    // resuming it would silently answer from the previous round's branch
-    // (`bestofn/mod.rs:596-615`). The digest removes that hazard, so
-    // "already exists" is simply success and no destructive pre-step is needed.
+    // Honour the DECLARED collision policy rather than reasoning about whether
+    // the digest makes it unnecessary.
+    //
+    // `bon/` is registered `ReplaceBeforeSave` (`ratio-names:38`). An earlier
+    // version skipped this and returned success on "already exists", justified
+    // by "the name is content-addressed, so an existing one holds identical KV
+    // by construction". That justification was false on resumed rounds, where
+    // the digest did not cover the picked candidate or the user's comment — so
+    // the code silently behaved as `AcceptExisting` while the registry said
+    // otherwise, and a colliding name retained the WRONG continuation's KV.
+    //
+    // The digest is complete now, but the policy is still read from the
+    // registry rather than assumed, which is the whole reason the registry
+    // exists: a future rename, or a new namespace routed through this path,
+    // cannot silently inherit the wrong column. chat-apc did exactly this
+    // (`bestofn/mod.rs:613-615`).
+    match collision_for(name) {
+        Some(Collision::ReplaceBeforeSave) => {
+            let _ = Context::delete(model, name);
+        }
+        Some(Collision::AcceptExisting) => {}
+        // Unregistered: skip the delete and let `save` fail loudly.
+        // Fail-closed, never silent-wrong KV.
+        None => eprintln!("[bestofn] snapshot {name} is in no registered namespace"),
+    }
     let mut snap = match base.fork() {
         Ok(c) => c,
         Err(e) => {
@@ -288,11 +307,12 @@ async fn save_candidate(model: &Model, base: &Context, answer: &str, name: &str)
     match snap.save(name) {
         Ok(()) => true,
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("already exists") {
-                return true;
-            }
-            eprintln!("[bestofn] save of snapshot {name} failed: {msg}");
+            // NOT special-casing "already exists". Under
+            // `ReplaceBeforeSave` the delete above should have cleared it, so
+            // reaching here means the name is held by something we could not
+            // remove — and treating that as success is what would serve
+            // another continuation's KV under this candidate's text.
+            eprintln!("[bestofn] save of snapshot {name} failed: {e}");
             false
         }
     }

@@ -792,6 +792,14 @@ public final class ChatSendController: ObservableObject {
   /// candidate's snapshot + text, the unpicked siblings to drop, and the new
   /// level the round generates at.
   public struct BestOfNResume: Equatable, Sendable {
+    /// The scope of the round being RESUMED.
+    ///
+    /// A think-more continues the same Best-of-N session, so it must carry the
+    /// prior round's scope forward — the guest authorizes `resume_from` and the
+    /// `unpicked` deletes against it, and a freshly minted scope makes every
+    /// one of those names belong to "a different round". Minting a new UUID per
+    /// call made think-more fail with a hard 400 on every attempt.
+    public let roundID: String
     public let pickedName: String
     public let pickedText: String
     /// Optional per-round user guidance for the next level (#715). Nil preserves
@@ -800,12 +808,14 @@ public final class ChatSendController: ObservableObject {
     public let unpicked: [String]
     public let level: Int
     public init(
+      roundID: String,
       pickedName: String,
       pickedText: String,
       selectedComment: String? = nil,
       unpicked: [String],
       level: Int
     ) {
+      self.roundID = roundID
       self.pickedName = pickedName
       self.pickedText = pickedText
       let trimmed = selectedComment?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -833,12 +843,18 @@ public final class ChatSendController: ObservableObject {
     cancel()
     generation &+= 1
     let myGeneration = generation
-    // The round's authorization scope, minted BEFORE the request so it exists
-    // even if the round never reaches its terminal — a round with no scope can
-    // never be released, and the guest refuses to mint snapshots without one.
-    // Client-minted rather than read back from `tree_start.id`: the guest needs
-    // it at snapshot-naming time, which is before the app has seen any frame.
-    let roundID = UUID().uuidString
+    // The round's authorization scope, established BEFORE the request so it
+    // exists even if the round never reaches its terminal — a round with no
+    // scope can never be released, and the guest refuses to mint snapshots
+    // without one. Client-owned rather than read back from `tree_start.id`:
+    // the guest needs it at snapshot-naming time, which is before the app has
+    // seen any frame.
+    //
+    // A think-more CONTINUES its round rather than starting one, so it carries
+    // the prior scope. Minting fresh here made the guest reject every
+    // `resume_from` as belonging to a different round — a hard 400 on every
+    // think-more. `level` is what distinguishes the steps within a session.
+    let roundID = resume?.roundID ?? UUID().uuidString
     guard let request = Self.makeBestOfNRequest(
       chat: chat, config: config, options: options, resume: resume, roundID: roundID)
     else {

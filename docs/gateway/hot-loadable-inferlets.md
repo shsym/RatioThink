@@ -338,6 +338,41 @@ be refused.
   `round_id`, so the app's flat cross-round name list would have had most of it
   refused while the ack looked like a benign short release.
 
+### Two defects found after the milestone, and why the gate missed them
+
+**P1 — think-more could not resume.** `sendBestOfN` minted a fresh
+`UUID().uuidString` on every call, including the resume, so the guest correctly
+refused `resume_from` as belonging to a different round. Reproduced: HTTP 400
+`snapshot_not_in_round` on every attempt. A think-more CONTINUES its round, so
+it now carries the prior scope; `level` is what distinguishes the steps.
+
+**P2 — resumed candidate names were incomplete.** On a resume, the digest
+covered the conversation prefix only, while the base the candidates actually
+fork from also holds `assistant(picked_text)` and the deepen turn. That made a
+level-2 name a function of `(answer)` alone, so two continuations differing only
+in which candidate the user picked — or in the comment they typed — produced the
+SAME name. Short answers collide constantly. Compounding it, `save_candidate`
+returned success on "already exists" while `bon/` is registered
+`Collision::ReplaceBeforeSave`: the code silently behaved as `AcceptExisting`,
+justified by a comment claiming the digest made the delete unnecessary. It did
+not. Both are fixed — the base tokens are complete, and the policy is read from
+the registry rather than assumed.
+
+**They interacted, and that is the lesson.** P1 was MASKING P2: a fresh scope
+per call meant two continuations landed under different round tags, so their
+names could not collide. Fixing P1 alone would have converted a loud 400 into a
+silent wrong-KV resume — the UI showing one continuation's text while the engine
+served another's context, which is precisely what content-addressing was
+introduced to prevent.
+
+**Why the gate stayed green.** `bon.py` built both hops itself and passed the
+same `round_id` to each, so it tested whether the guest enforces its contract
+and never whether the client can satisfy it. A gate that constructs its own
+inputs can only test the half it models. It now mirrors the client — carries the
+scope forward — and asserts `resume="warm"`, which required surfacing the resume
+kind in the driver's log. Verified as a negative control: reverting the gate to
+mint a fresh scope makes it fail.
+
 ### The view-side commit
 
 Wired. A level-2 pick now runs the commit operation instead of a bare release,

@@ -1081,7 +1081,14 @@ struct ChatScaffoldView: View {
       guard let chosen = round.chosen,
             let pickedText = bestOfNCandidateText(message: message, nodeID: chosen.id)
       else { return }
+      // A think-more CONTINUES this round, so it carries this round's scope.
+      // The guest authorizes `resume_from` and the `unpicked` deletes against
+      // it; a fresh scope makes every one of those names belong to a different
+      // round. A round with no scope cannot be resumed at all — it predates the
+      // field — so those fall through to the guard below.
+      guard let roundID = round.roundID, !roundID.isEmpty else { return }
       let resume = ChatSendController.BestOfNResume(
+        roundID: roundID,
         pickedName: chosen.snapshotName,
         pickedText: pickedText,
         selectedComment: selectedComment,

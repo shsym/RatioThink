@@ -245,7 +245,13 @@ cmd_bon() {
   [[ -n "$bon_reused" && "$bon_reused" -gt 0 ]] || { echo "❌ round 1 did not reuse chat's boundary (entry half)"; return 1; }
   [[ -n "$chat_reused" && "$chat_reused" -gt "$bon_reused" ]] || {
     echo "❌ chat reused ${chat_reused:-none} <= round 1's $bon_reused — it fell back to the pre-round boundary, so the commit's save did not land"; return 1; }
-  echo "✅ C gate passed: round 1 reused $bon_reused (entry), chat after commit reused $chat_reused (exit)"
+  # The think-more hop must WARM-START. A resume that silently falls back to a
+  # cold rebuild looks identical from outside the guest, so this is the only
+  # place it can be caught — and a scope that is not carried forward does not
+  # even reach the cold path, it 400s.
+  echo "$slice" | grep -q 'resume="warm" resume_validated=true' || {
+    echo "❌ no warm resume: the think-more hop did not carry its round scope, or the pick failed to verify"; return 1; }
+  echo "✅ C gate passed: round 1 reused $bon_reused (entry), warm think-more, chat after commit reused $chat_reused (exit)"
 }
 
 # The view's commit path: replay the EXACT body ChatScaffoldView now builds.

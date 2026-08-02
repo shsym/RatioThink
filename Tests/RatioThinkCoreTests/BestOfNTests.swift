@@ -322,6 +322,7 @@ final class BestOfNTests: XCTestCase {
       persistenceStatus: PersistenceStatus(),
       options: ChatSendRequestOptions(modelID: "m"),
       resume: ChatSendController.BestOfNResume(
+        roundID: "ROUND-1",
         pickedName: "bon/r0/1/1",
         pickedText: "Use a phased launch.",
         selectedComment: "Emphasize launch risks and mitigations.",
@@ -373,6 +374,7 @@ final class BestOfNTests: XCTestCase {
       persistenceStatus: PersistenceStatus(),
       options: ChatSendRequestOptions(modelID: "m"),
       resume: ChatSendController.BestOfNResume(
+        roundID: "ROUND-1",
         pickedName: "bon/r0/1/1", pickedText: "Use a phased launch.",
         selectedComment: guidance, unpicked: ["bon/r0/1/0"], level: 2))
 

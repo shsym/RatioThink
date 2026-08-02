@@ -63,10 +63,19 @@ def chat(msgs, turn, label):
     return txt, d["usage"]["prompt_tokens"]
 
 
+LAST_TEXTS = {}
+
+
 def bon(payload, label):
-    """A generative round: SSE in, (candidates, result) out."""
+    """A generative round: SSE in, (candidates, error) out.
+
+    Also captures each node's committed text from `node_complete`, which a real
+    think-more needs — `picked_text` is what the base is rebuilt from when the
+    snapshot cannot be verified or has been evicted.
+    """
+    global LAST_TEXTS
     _, raw = post("/v1/inferlet", {"inferlet": "best-of-n", "input": payload})
-    cands, err = [], None
+    cands, err, texts = [], None, {}
     for line in raw.splitlines():
         if not line.startswith("data: "):
             continue
@@ -76,8 +85,12 @@ def bon(payload, label):
         ev = json.loads(p)
         if ev.get("event") == "awaiting_selection":
             cands = ev["candidates"]
+        elif ev.get("event") == "node_complete":
+            n = ev["node"]
+            texts[n["id"]] = n.get("content", "")
         elif ev.get("event") == "error":
             err = ev
+    LAST_TEXTS = texts
     print(f"  {label}: {len(cands)} candidates" + (f"  ERROR {err}" if err else ""))
     return cands, err
 
@@ -108,6 +121,7 @@ base_round = {
     "thinking": False, "temperature": 0.9, "boundary": boundary(2),
 }
 cands1, err1 = bon({**base_round, "round_id": ROUND_ID_1, "level": 1}, "round 1")
+texts1 = dict(LAST_TEXTS)
 check("round 1 produced candidates", not err1 and len(cands1) >= 2)
 if not cands1:
     print("cannot continue without candidates")
@@ -121,23 +135,65 @@ check(
 )
 
 # ------------------------------------------------ turn 2b: think-more (resume)
-print("turn 2b think-more  <- must VALIDATE the pick before opening it")
+#
+# THE APP'S ACTUAL FLOW. An earlier version of this gate built both hops itself
+# and passed the SAME round_id to each — which tested the guest's contract while
+# silently sidestepping whether the client could satisfy it. `sendBestOfN` minted
+# a fresh scope on every call, so every real think-more failed with a hard 400
+# and this gate stayed green. A gate that builds its own inputs can only test
+# the half it models, so it now mirrors the client: carry the scope forward.
+print("turn 2b think-more  <- must carry the round scope, and warm-start")
 picked = cands1[0]
-picked_text = None
-# Recover the picked candidate's text from its node_complete is not exposed
-# here, so re-derive from a fresh round is wrong; instead use the commit path
-# below. For resume we need the exact text, so ask for it via a second stream.
-# The gate keeps this simple: resume with a KNOWN-WRONG text must NOT warm-start.
+picked_text = texts1.get(picked["id"], "")
+check("the picked candidate's text is known", bool(picked_text), repr(picked_text[:40]))
+
+cands2b, err2b = bon(
+    {
+        **base_round, "round_id": ROUND_ID_1, "level": 2,
+        "resume_from": picked["snapshot_name"],
+        "picked_text": picked_text,
+        "unpicked": [n for n in names1 if n != picked["snapshot_name"]],
+    },
+    "think-more (scope carried)",
+)
+check("think-more produced candidates", not err2b and len(cands2b) >= 1)
+names2b = [c["snapshot_name"] for c in cands2b]
+if names2b:
+    check("resumed candidates keep the SAME round scope",
+          all(n.split("/")[1] == names1[0].split("/")[1] for n in names2b))
+    check("resumed candidates are a distinct level",
+          all(n.split("/")[2] == "2" for n in names2b), names2b[0])
+    # P2: the resumed base includes the picked answer and the deepen turn, so a
+    # level-2 name cannot be a function of the answer alone. If it were, two
+    # continuations differing only in the pick would collide.
+    check("resumed names differ from the level they resumed",
+          not (set(names2b) & set(names1)))
+
+# A mismatched pair must still yield a usable round: it rebuilds rather than
+# rejecting, because benign history drift must not kill a working session.
 cands_bad, err_bad = bon(
     {
         **base_round, "round_id": ROUND_ID_1, "level": 2,
         "resume_from": picked["snapshot_name"],
         "picked_text": "a text that is definitely not the picked candidate",
-        "unpicked": [n for n in names1 if n != picked["snapshot_name"]],
+        "unpicked": [],
     },
     "resume with a mismatched pair",
 )
 check("a mismatched pair still produces a usable round", not err_bad and len(cands_bad) >= 1)
+
+# A pick from ANOTHER round is authorization, not drift — a hard 400.
+code_x, body_x = control(
+    {
+        **base_round, "round_id": ROUND_ID_2, "level": 2,
+        "resume_from": picked["snapshot_name"],
+        "picked_text": picked_text,
+        "unpicked": [],
+    },
+    "resume a pick from another round",
+)
+check("resuming another round's pick is rejected",
+      code_x == 400 and body_x.get("error", {}).get("code") == "snapshot_not_in_round")
 
 # ------------------------------------------------------- the destructive guards
 print("guards  <- the only place a guest deletes durable state on client say-so")

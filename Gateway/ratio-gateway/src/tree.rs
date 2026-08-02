@@ -380,6 +380,12 @@ async fn drive(
                                 reused_tokens = v.get("reused_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
                                 model = v.get("model").and_then(|m| m.as_str()).unwrap_or(""),
                                 synthesized = v.get("synthesized").and_then(|s| s.as_bool()).unwrap_or(false),
+                                // Best-of-N resume diagnostics. A think-more
+                                // that silently falls back to a cold rebuild
+                                // looks identical to a warm one from the
+                                // outside, so a gate can only assert on this.
+                                resume = v.get("resume").and_then(|r| r.get("kind")).and_then(|k| k.as_str()).unwrap_or(""),
+                                resume_validated = v.get("resume").and_then(|r| r.get("validated")).and_then(|b| b.as_bool()).unwrap_or(false),
                                 "tree kv reuse"
                             );
                         }

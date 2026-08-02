@@ -266,6 +266,47 @@ final class BestOfNCommitEncodingTests: XCTestCase {
       chat: chat, options: options, round: unpicked, answer: "candidate A"))
   }
 
+  /// A think-more must reuse the round it is continuing, not mint a new scope.
+  ///
+  /// This is the bug a guest-side gate could never catch: `bon.py` builds its
+  /// own requests, so it passed the same `round_id` to both hops and exercised
+  /// the guest's contract while silently sidestepping whether the CLIENT can
+  /// satisfy it. Minting fresh here made the guest reject every `resume_from`
+  /// as belonging to a different round — a hard 400 on every think-more.
+  @MainActor
+  func testAThinkMoreCarriesTheRoundScope() throws {
+    let resume = ChatSendController.BestOfNResume(
+      roundID: "ROUND-1",
+      pickedName: "bon/aa/1/0/bb",
+      pickedText: "candidate A",
+      unpicked: ["bon/aa/1/1/cc"],
+      level: 2)
+    XCTAssertEqual(resume.roundID, "ROUND-1")
+
+    // The request builder must put THAT scope on the wire, not a fresh one.
+    let data = try JSONEncoder().encode(
+      BestOfNRequestInput(
+        model: "qwen",
+        boundary: ChatCacheDirective(key: "K", turn: 2),
+        roundID: resume.roundID,
+        messages: [ChatMessage(role: .user, content: "hi")],
+        n: 3,
+        maxTokensPerCandidate: 256,
+        thinking: false,
+        temperature: 0.7,
+        topP: 1.0,
+        resumeFrom: resume.pickedName,
+        pickedText: resume.pickedText,
+        selectedComment: nil,
+        unpicked: resume.unpicked,
+        level: resume.level))
+    let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    XCTAssertEqual(json["round_id"] as? String, "ROUND-1",
+                   "a resumed round must carry the scope its snapshots were minted under")
+    XCTAssertEqual(json["resume_from"] as? String, "bon/aa/1/0/bb")
+    XCTAssertEqual(json["level"] as? Int, 2, "level distinguishes steps within one scope")
+  }
+
   /// `boundary_saved: false` means the guest deleted NOTHING, so the caller
   /// must still free the round. A decoder that defaulted this to true would
   /// leak the round's KV on every failed save.
