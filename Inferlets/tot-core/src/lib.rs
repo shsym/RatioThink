@@ -158,12 +158,14 @@ pub async fn run_tot(input: TotInput, sink: &dyn EventSink) -> Result<TreeResult
     // cache-write fault replace `tree_complete` with an error terminal and
     // discard a completed multi-branch search. Fork/flush faults are likeliest
     // under exactly the KV pressure a 15-21-context search creates.
-    if let Some(answer) = outcome.final_answer.as_deref() {
-        if let Err(e) =
-            boundary::save_boundary(&canonical, &model, &model_id, &directive, answer).await
-        {
-            eprintln!("[tot] boundary save failed ({}): {}", e.code, e.message);
-        }
+    // Even a search with no usable final answer leaves its cue-free input
+    // prompt as a valid cross-mode checkpoint. `open_canonical` saved it before
+    // the search; `None` retries that save without persisting branch reasoning.
+    let visible_answer = outcome.final_answer.as_deref().filter(|answer| !answer.is_empty());
+    if let Err(e) =
+        boundary::save_boundary(&canonical, &model, &model_id, &directive, visible_answer).await
+    {
+        eprintln!("[tot] boundary save failed ({}): {}", e.code, e.message);
     }
 
     // `wstd`'s clock is the one that works in wasip2; `GenerationMetrics`
@@ -207,4 +209,3 @@ pub async fn run_tot(input: TotInput, sink: &dyn EventSink) -> Result<TreeResult
         reused_tokens: canonical.outcome.reused_tokens as u32,
     })
 }
-

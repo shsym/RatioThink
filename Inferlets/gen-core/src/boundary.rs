@@ -2,7 +2,7 @@
 //! this turn's behind.
 //!
 //! Ported from `chat-apc/src/chat/prefix_cache.rs` (`plan` :714-765,
-//! `finalize` :903-950) with three deliberate corrections:
+//! `finalize` :903-950) with four deliberate corrections:
 //!
 //! 1. **Names come from `ratio-names`**, so every mode computes the same name
 //!    for the same history. chat-apc folds a per-crate `CARGO_PKG_VERSION` into
@@ -13,6 +13,11 @@
 //! 3. **The canonical context is kept, never reconstructed.** Callers generate
 //!    on a *fork* and save from the untouched canonical one, so cue, reasoning
 //!    and branch tokens can never leak into a boundary.
+//! 4. **The input boundary is checkpointed before generation.** A reasoning
+//!    model can exhaust its output budget before producing visible content.
+//!    The app then omits the empty assistant row from the next request, so the
+//!    cue-free input prompt is still the deepest valid reusable boundary even
+//!    though there is no assistant boundary to save.
 //!
 //! ## The canonical shape
 //!
@@ -116,6 +121,13 @@ pub struct Canonical {
     pub ctx: Context,
     pub tokens: Vec<u32>,
     pub outcome: OpenOutcome,
+    /// Whether the exact cue-free input boundary is already durable.
+    ///
+    /// This is saved by [`open_canonical`] before any mode-specific work. It is
+    /// load-bearing for reasoning-only turns: when `content == ""`, the app
+    /// drops the empty assistant row, and the next request falls back to this
+    /// prompt boundary rather than re-prefilling the whole conversation.
+    pub prompt_saved: bool,
 }
 
 /// Candidate boundaries, longest first: the exact prompt, then progressively
@@ -190,6 +202,12 @@ pub async fn open_canonical(
             ctx.flush()
                 .await
                 .map_err(|e| GenError::new(crate::classify_engine_error(&e), e))?;
+            // Promote a ladder hit to the exact input boundary before any
+            // mode-specific fork is made. This is safe even if generation
+            // later fails: the snapshot represents only client-sent history,
+            // with no cue, reasoning, branch directive or generated token.
+            let prompt_saved =
+                save_prompt_checkpoint(&ctx, directive, model_id, &canonical);
             return Ok(Canonical {
                 ctx,
                 outcome: OpenOutcome {
@@ -199,6 +217,7 @@ pub async fn open_canonical(
                     exact: prefix.len() == canonical.len(),
                 },
                 tokens: canonical,
+                prompt_saved,
             });
         }
     }
@@ -208,18 +227,46 @@ pub async fn open_canonical(
     ctx.flush()
         .await
         .map_err(|e| GenError::new(crate::classify_engine_error(&e), e))?;
+    let prompt_saved = save_prompt_checkpoint(&ctx, directive, model_id, &canonical);
     Ok(Canonical {
         outcome: OpenOutcome::cold(canonical.len()),
         tokens: canonical,
         ctx,
+        prompt_saved,
     })
 }
 
-/// Exit half: leave both canonical boundaries for the next turn, whatever mode
-/// runs it.
+/// Save the exact cue-free input boundary, best-effort.
+///
+/// This deliberately happens in the entry half rather than waiting for a
+/// visible answer. A reasoning model may return `finish_reason=length` with all
+/// output in `reasoning_content` and `content=""`; the app omits that empty
+/// assistant row from history, so this prompt is exactly the boundary the next
+/// mode can reuse. Saving the live generation context instead would be wrong:
+/// it contains hidden reasoning the app never resends.
+fn save_prompt_checkpoint(
+    ctx: &Context,
+    directive: &BoundaryDirective,
+    model_id: &str,
+    tokens: &[u32],
+) -> bool {
+    if !directive.enabled || directive.key.is_empty() || tokens.is_empty() {
+        return false;
+    }
+    save_one(
+        ctx,
+        &SnapshotName::conv(&directive.key, &directive.compat, model_id, tokens),
+    )
+}
+
+/// Exit half: leave the visible-answer boundary for the next turn, whatever
+/// mode runs it. The prompt boundary was already attempted by
+/// [`open_canonical`] and is retried here if that first save failed.
 ///
 /// `canonical` must be the untouched context from [`open_canonical`]. It is
-/// forked, not consumed.
+/// forked, not consumed. `answer=None` means the turn produced no visible
+/// assistant content; in that case only the prompt boundary is valid because
+/// the app excludes the empty assistant row from future request history.
 ///
 /// ORDERING: callers must complete this **before** emitting their terminal
 /// event. A client that sees the terminal frame may issue the next request
@@ -229,27 +276,26 @@ pub async fn save_boundary(
     model: &Model,
     model_id: &str,
     directive: &BoundaryDirective,
-    answer: &str,
+    answer: Option<&str>,
 ) -> Result<SaveOutcome, GenError> {
     if !directive.enabled || directive.key.is_empty() {
         return Ok(SaveOutcome::disabled());
     }
 
+    // `open_canonical` normally landed this before generation. Retry directly
+    // from the still-untouched, already-flushed context if the entry save
+    // failed. No fork is needed until there is visible assistant text to add.
+    let prompt_saved = canonical.prompt_saved
+        || save_prompt_checkpoint(&canonical.ctx, directive, model_id, &canonical.tokens);
+
+    let Some(answer) = answer.filter(|s| !s.is_empty()) else {
+        return Ok(SaveOutcome { prompt_saved, full_saved: false });
+    };
+
     let mut snap = canonical
         .ctx
         .fork()
         .map_err(|e| GenError::new("boundary_fork_failed", e))?;
-
-    // `save` cannot capture an unflushed buffer, so a save without a preceding
-    // flush parks a snapshot shorter than its name claims — i.e. a name that
-    // lies about its contents.
-    snap.flush()
-        .await
-        .map_err(|e| GenError::new("boundary_flush_failed", e))?;
-    let prompt_saved = save_one(
-        &snap,
-        &SnapshotName::conv(&directive.key, &directive.compat, model_id, &canonical.tokens),
-    );
 
     // The generated boundary: what the NEXT turn's history will hash to, given
     // the client persists and resends exactly this visible answer.
@@ -305,11 +351,13 @@ fn save_one(ctx: &Context, name: &SnapshotName) -> bool {
 /// cannot report failure would free the KV after writing nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SaveOutcome {
-    /// The prompt-only boundary (this turn's history, no answer).
+    /// The prompt-only boundary (this turn's client-sent history, no cue and no
+    /// generated reasoning). This may be true when `full_saved` is false.
     pub prompt_saved: bool,
     /// The generated boundary — history + assistant(answer). THIS is the one
-    /// the next turn's ladder hits, so it is what an irreversible follow-up
-    /// action must gate on.
+    /// the next turn normally hits. False is expected for a reasoning-only turn
+    /// whose visible answer is empty; an irreversible follow-up action such as
+    /// Best-of-N release must still require it.
     pub full_saved: bool,
 }
 
@@ -353,6 +401,16 @@ mod tests {
         let impostor = vec![9u32, 9, 9];
         assert!(!canonical.starts_with(&impostor));
         assert!(canonical.starts_with(&[1u32, 2, 3]));
+    }
+
+    #[test]
+    fn prompt_only_save_is_a_successful_partial_checkpoint() {
+        // A reasoning-only turn has no assistant boundary, but the cue-free
+        // input prompt is still reusable by the next mode. Do not collapse
+        // that state into `disabled()` or pretend a full boundary landed.
+        let outcome = SaveOutcome { prompt_saved: true, full_saved: false };
+        assert!(outcome.prompt_saved);
+        assert!(!outcome.full_saved);
     }
 }
 

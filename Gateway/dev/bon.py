@@ -24,11 +24,10 @@ import urllib.request
 
 BASE = "http://127.0.0.1:%s" % os.environ.get("PORT", "8100")
 KEY = sys.argv[1] if len(sys.argv) > 1 else "c-gate"
-# PROBLEM: a reasoning model spends this whole budget in its thinking block and
-# returns content="" (finish_reason=length), which leaves turn 1 with an empty
-# assistant turn and makes the entry-half check fail as if the cache were
-# broken. Full explanation in crossmode.py; if turn 1 prints `-> ''`, raise
-# this rather than hunting a KV bug.
+# Keep the small default as a regression case: a reasoning model may return
+# content="" after spending the budget in `reasoning_content`. The app omits
+# that empty assistant from history, and the round must enter through chat's
+# prompt-only checkpoint. See crossmode.py.
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32"))
 FAILURES = []
 
@@ -54,6 +53,13 @@ def check(label, ok, detail=""):
 
 def boundary(turn):
     return {"key": KEY, "turn": turn, "compat": "1", "policy": "auto"}
+
+
+def append_persisted_assistant(history, content):
+    """Mirror ChatSendController.excludesFromRequestHistory exactly."""
+    if content is None or content == "":
+        return list(history)
+    return list(history) + [{"role": "assistant", "content": content}]
 
 
 def chat(msgs, turn, label):
@@ -117,7 +123,7 @@ print(f"key={KEY}")
 print("turn 1  chat (cold)")
 A = "The capital of France is"
 a1, _ = chat([{"role": "user", "content": A}], 1, "chat")
-hist = [{"role": "user", "content": A}, {"role": "assistant", "content": a1}]
+hist = append_persisted_assistant([{"role": "user", "content": A}], a1)
 
 # ------------------------------------------------- turn 2: Best-of-N, round 1
 print("turn 2  best-of-n round 1  <- must REUSE the boundary chat left")

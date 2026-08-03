@@ -153,7 +153,8 @@ pub async fn run(
     let (round_id, _snapshot_name, answer) = validate(commit, round_id, messages)?;
 
     let canonical = boundary::open_canonical(model, model_id, directive, messages).await?;
-    let outcome = boundary::save_boundary(&canonical, model, model_id, directive, &answer).await?;
+    let outcome =
+        boundary::save_boundary(&canonical, model, model_id, directive, Some(&answer)).await?;
 
     // THE GATE. `full_saved` is the history+answer boundary — the one the next
     // turn's ladder actually hits. Nothing is deleted unless it landed.

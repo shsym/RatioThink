@@ -35,7 +35,7 @@ child re-prefill.
 | Eviction policy fix | **Ship without it** — but add the observability API (§5) |
 | `conv/` writer | **Shared `gen_core::save_boundary`** |
 | Scope | **ToT first, Best-of-N after** |
-| Caching granularity | **Final answer only** |
+| Caching granularity | **Canonical input + visible final answer; never hidden reasoning** |
 | `bon-0` collision | Document; superseded by §6 digest naming |
 | Reuse direction | **Both** entry and exit |
 | Inferlet trust | **Trusted directory** for now; true drop-in needs pie ACLs (§4.3) |
@@ -44,7 +44,7 @@ child re-prefill.
 
 ```
 conv/{h(chat_key)}/{h(compat)}/{digest}
-digest = BLAKE3(len-delimited: model_id ‖ PROMPT_MARKER ‖ prefix_tokens)
+digest = SHA-256(len-delimited: model_id ‖ PROMPT_MARKER ‖ prefix_tokens)
 ```
 
 **Digest, not FNV.** The reference implementation's paired FNV construction is
@@ -67,6 +67,20 @@ user message when `thinking:false`, chat does not. Mutating the base diverges
 their tokens from chat's for the same conversation. Move it **after the fork**,
 per branch — legacy notes the per-branch prefill already carries it
 (`bestofn/mod.rs:235`).
+
+**(c) Checkpoint the canonical input before generation.** A reasoning model can
+spend the entire output budget in `reasoning_content` and return `content=""`.
+The app deliberately excludes that empty assistant row from the next request,
+so no assistant boundary exists to save. `open_canonical` therefore saves the
+flushed, cue-free client input immediately. Generation still runs on a fork;
+hidden reasoning, ToT branch text, Best-of-N directives, and mode-specific cues
+can never enter `conv/`. If visible answer text is produced, `save_boundary`
+also saves `canonical input + assistant(answer)` before the terminal event.
+
+This gives a reasoning-only turn a valid prompt-only checkpoint rather than a
+false cold start when the next request changes mode. It intentionally does not
+cache hidden reasoning: those tokens are absent from the client-resendable
+transcript and differ between normal, ToT, and Best-of-N execution.
 
 ### 3.1 What "same boundary" means
 
@@ -284,6 +298,11 @@ Turn 2 proves the entry half (ToT opened the boundary chat left); turn 3 proves
 the exit half, and 44 > 22 is what proves it hit ToT's boundary rather than
 falling back to turn 1's. Legacy ToT has no `Context::save|open` at all, so this
 is a capability that did not previously exist.
+
+The gate deliberately keeps a small output budget. On a reasoning model this
+can produce only `reasoning_content` and an empty visible answer. In that case
+the next turn must reuse the prompt-only checkpoint from §3(c); increasing the
+budget would hide the regression rather than test its cache policy.
 
 **The exit criterion was restated.** The plan said "exact hit"; that is
 unsatisfiable by construction. `OpenOutcome.exact` requires a boundary named

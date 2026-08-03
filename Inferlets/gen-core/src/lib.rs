@@ -297,9 +297,21 @@ pub async fn run_chat(
     // buffered path that is a blank response. Fork/flush faults are most likely
     // under exactly the KV pressure that makes saving valuable, so this is not
     // a hypothetical ordering.
-    if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) && !content.is_empty() {
+    if matches!(outcome, Outcome::Natural | Outcome::MaxTokens) {
+        // A reasoning model can consume the whole budget before producing
+        // visible content. `open_canonical` already checkpointed the cue-free
+        // prompt, and passing `None` here preserves that valid fallback without
+        // manufacturing an empty assistant turn or caching hidden reasoning.
+        let visible_answer = (!content.is_empty()).then_some(content.as_str());
         if let Err(e) =
-            boundary::save_boundary(&canonical, &model, &req.model, &directive, &content).await
+            boundary::save_boundary(
+                &canonical,
+                &model,
+                &req.model,
+                &directive,
+                visible_answer,
+            )
+            .await
         {
             eprintln!("[gen-core] boundary save failed ({}): {}", e.code, e.message);
         }
