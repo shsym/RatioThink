@@ -180,8 +180,15 @@ final class BestOfNCommitEncodingTests: XCTestCase {
   /// THE ordering invariant. The guest appends `assistant(answer)` itself, so a
   /// history that already contains the answer names a boundary with it twice —
   /// one the next chat turn never asks for. An assistant row with empty content
-  /// is excluded from request history, which is exactly why the commit must be
-  /// prepared BEFORE the answer is written locally.
+  /// is excluded from request history (`excludesFromRequestHistory`), which is
+  /// exactly why the commit must be prepared BEFORE the answer is written
+  /// locally, and dispatched after.
+  ///
+  /// Prepared in the wrong order the same call yields three messages including
+  /// the answer. That was once asserted as a separate test; it is recorded here
+  /// instead, because production has no guard it could exercise — the ordering
+  /// lives in one call site, so a violation is a code change, not a regression
+  /// a test can catch.
   @MainActor
   func testCommitMessagesExcludeTheAcceptedAnswer() throws {
     let (chat, _, round) = try chatWithRound(answerCommitted: false)
@@ -197,23 +204,6 @@ final class BestOfNCommitEncodingTests: XCTestCase {
       "the accepted answer must not appear in messages — the guest appends it")
     XCTAssertEqual(json["commit"].flatMap { ($0 as? [String: Any])?["answer"] as? String },
                    "candidate A")
-  }
-
-  /// Proof the ordering is load-bearing rather than incidental: prepared AFTER
-  /// the answer is written, the same call produces a history that DOES contain
-  /// it. The guest would then append it a second time and name a boundary the
-  /// next chat turn never asks for.
-  @MainActor
-  func testPreparingAfterTheCommitWouldDuplicateTheAnswer() throws {
-    let (chat, _, round) = try chatWithRound(answerCommitted: true)
-    let prepared = try XCTUnwrap(
-      ChatSendController.prepareBestOfNCommit(
-        chat: chat, options: options, round: round, answer: "candidate A"))
-    let messages = try XCTUnwrap(try body(prepared)["messages"] as? [[String: Any]])
-    XCTAssertTrue(
-      messages.contains { ($0["content"] as? String) == "candidate A" },
-      "this is the WRONG order — it is asserted only to show the invariant has teeth")
-    XCTAssertEqual(messages.count, 3, "system + user + the already-committed answer")
   }
 
   /// The system prompt is part of the digested history. If the commit assembled
@@ -264,47 +254,6 @@ final class BestOfNCommitEncodingTests: XCTestCase {
     unpicked.chosenID = nil
     XCTAssertNil(ChatSendController.prepareBestOfNCommit(
       chat: chat, options: options, round: unpicked, answer: "candidate A"))
-  }
-
-  /// A think-more must reuse the round it is continuing, not mint a new scope.
-  ///
-  /// This is the bug a guest-side gate could never catch: `bon.py` builds its
-  /// own requests, so it passed the same `round_id` to both hops and exercised
-  /// the guest's contract while silently sidestepping whether the CLIENT can
-  /// satisfy it. Minting fresh here made the guest reject every `resume_from`
-  /// as belonging to a different round — a hard 400 on every think-more.
-  @MainActor
-  func testAThinkMoreCarriesTheRoundScope() throws {
-    let resume = ChatSendController.BestOfNResume(
-      roundID: "ROUND-1",
-      pickedName: "bon/aa/1/0/bb",
-      pickedText: "candidate A",
-      unpicked: ["bon/aa/1/1/cc"],
-      level: 2)
-    XCTAssertEqual(resume.roundID, "ROUND-1")
-
-    // The request builder must put THAT scope on the wire, not a fresh one.
-    let data = try JSONEncoder().encode(
-      BestOfNRequestInput(
-        model: "qwen",
-        boundary: ChatCacheDirective(key: "K", turn: 2),
-        roundID: resume.roundID,
-        messages: [ChatMessage(role: .user, content: "hi")],
-        n: 3,
-        maxTokensPerCandidate: 256,
-        thinking: false,
-        temperature: 0.7,
-        topP: 1.0,
-        resumeFrom: resume.pickedName,
-        pickedText: resume.pickedText,
-        selectedComment: nil,
-        unpicked: resume.unpicked,
-        level: resume.level))
-    let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-    XCTAssertEqual(json["round_id"] as? String, "ROUND-1",
-                   "a resumed round must carry the scope its snapshots were minted under")
-    XCTAssertEqual(json["resume_from"] as? String, "bon/aa/1/0/bb")
-    XCTAssertEqual(json["level"] as? Int, 2, "level distinguishes steps within one scope")
   }
 
   /// `boundary_saved: false` means the guest deleted NOTHING, so the caller

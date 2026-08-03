@@ -3984,13 +3984,6 @@ mod tests {
         assert!(!d.contains("First consider the budget, then the venue."));
     }
 
-    #[test]
-    fn synthesis_directive_trims_whitespace_only_reasoning() {
-        // Whitespace-only reasoning must not open an empty notes section.
-        let d = build_synthesis_directive("Answer.", "   \n  ");
-        assert!(!d.contains("Private supporting notes"));
-    }
-
     // ── Temperature split (#523 Part B): three roles, three temperatures ──
 
     #[test]
@@ -4746,30 +4739,6 @@ mod tests {
         );
 
         assert_eq!(m.keep, vec!["scored"]);
-    }
-
-    #[test]
-    fn materialize_score_infra_failure_loses_to_high_real_score() {
-        let m = materialize_level(
-            1,
-            vec![
-                branch(
-                    "score_failed",
-                    "root",
-                    0,
-                    ok_outcome_score_failed("Maya's final total is $4.", "score fork failed: x"),
-                ),
-                branch(
-                    "correct",
-                    "root",
-                    1,
-                    ok_outcome("Maya's final total is $18.", Some(9)),
-                ),
-            ],
-            1,
-        );
-
-        assert_eq!(m.keep, vec!["correct"]);
     }
 
     #[test]

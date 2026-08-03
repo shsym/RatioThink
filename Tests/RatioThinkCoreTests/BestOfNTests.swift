@@ -338,6 +338,17 @@ final class BestOfNTests: XCTestCase {
     let req = try XCTUnwrap(engine.lastRequest, "think-more must dispatch a best-of-n request")
     XCTAssertEqual(req.inferlet, "best-of-n")
     let input = try JSONDecoder().decode(BestOfNResumeWire.self, from: req.input)
+    // A think-more CONTINUES its round, so `sendBestOfN` must forward the
+    // resume's scope rather than mint a fresh one. When it minted, the guest
+    // refused every `resume_from` as belonging to a different round and
+    // think-more failed with a hard 400 on every attempt.
+    //
+    // Asserted HERE, on the request the production builder actually produced,
+    // rather than on a `BestOfNRequestInput` a test assembled itself — the
+    // latter only proves JSONEncoder works and would stay green if
+    // `makeBestOfNRequest` stopped forwarding the scope. That is the same
+    // construct-your-own-input flaw as the bug it guards.
+    XCTAssertEqual(input.roundID, "ROUND-1")
     XCTAssertEqual(input.resumeFrom, "bon/r0/1/1")
     XCTAssertEqual(input.pickedText, "Use a phased launch.")
     XCTAssertEqual(input.selectedComment, "Emphasize launch risks and mitigations.")
@@ -523,6 +534,7 @@ final class BestOfNTests: XCTestCase {
   }
 
   private struct BestOfNResumeWire: Decodable {
+    let roundID: String?
     let resumeFrom: String?
     let pickedText: String?
     let selectedComment: String?
@@ -530,6 +542,7 @@ final class BestOfNTests: XCTestCase {
     let level: Int?
 
     private enum CodingKeys: String, CodingKey {
+      case roundID = "round_id"
       case resumeFrom = "resume_from"
       case pickedText = "picked_text"
       case selectedComment = "selected_comment"

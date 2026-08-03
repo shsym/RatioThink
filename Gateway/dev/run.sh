@@ -322,9 +322,14 @@ cmd_test() {
   echo "==> ratio-wire (golden + forward-compat)"; ( cd "$REPO/Inferlets/ratio-wire" && cargo test )
   echo "==> gen-core (schema/demux/prompt/boundary)"; ( cd "$REPO/Inferlets/gen-core"  && cargo test --lib )
   echo "==> ratio-names";                            ( cd "$REPO/Inferlets/ratio-names" && cargo test )
-  # Both feature states: the exec-strategies gate changes which `exec` values
-  # `resolve` accepts, and only the OFF build is what ships.
-  echo "==> tot-core (search/tree/diversity/schema/stream)";       ( cd "$REPO/Inferlets/tot-core" && cargo test --lib && cargo test --lib --features exec-strategies )
+  echo "==> tot-core (search/tree/diversity/schema/stream)";       ( cd "$REPO/Inferlets/tot-core" && cargo test --lib )
+  # The exec-strategies feature changes ONE thing: which `exec` values
+  # `resolve` accepts (Cargo.toml:[features]). Every `#[cfg(...exec-strategies)]`
+  # in the crate is in schema.rs's test module, so the second pass is filtered
+  # to `schema::` — re-running the other 184 tests under the flag proved nothing
+  # and doubled the suite. Filtered by MODULE, not by test name, so a new
+  # feature-gated schema test is covered without editing this line.
+  echo "==> tot-core (exec-strategies gate only)";                 ( cd "$REPO/Inferlets/tot-core" && cargo test --lib --features exec-strategies schema:: )
   echo "==> bestofn-core (round/resume/commit/release)"; ( cd "$REPO/Inferlets/bestofn-core" && cargo test --lib )
   echo "==> gateway";                                ( cd "$REPO/Gateway"             && cargo test )
 }
