@@ -157,11 +157,41 @@ Victim selection is still degenerate (snapshot `spawn_time` falls back to
 every bid hardcoded `0.0`, `snapshot.rs:189,343,778`; `active_snapshots` read only
 by `enforce_snapshot_retention`, `:424-428` — so `retain_snapshot` is decorative).
 
-**Observability is required, not optional.** "Count a replay-open as a miss" is
-unimplementable: the WIT returns `result<context, error>` with no residency or
-replay report. Add a small API surfacing `snapshot_found` plus
-`resident_prefix_tokens` / `replayed_tokens`. Without it the verification in §8
-cannot be written and the cache looks healthy while re-prefilling.
+**Observability is required, not optional — and NOT DELIVERED.** "Count a
+replay-open as a miss" is unimplementable: `Context::open` returns
+`Result<Self>` with no third state for "found, but I rebuilt it". The fix is a
+pie-side API surfacing `snapshot_found` plus `resident_prefix_tokens` /
+`replayed_tokens`.
+
+**Decision (2026-08-03): deferred, pie is not being modified.** So this ships
+with the hole open, and everything downstream inherits it:
+
+- every reuse number in the milestone gates is NAME-level. `reused_tokens = 44`
+  means a boundary with that name covered 44 tokens, not that they were
+  resident. An evicted boundary opens successfully, replays, and logs
+  identically;
+- the gates run on a quiet engine with one short conversation — the regime where
+  eviction never fires — so they have never exercised the failure they cannot
+  detect. Nothing in this branch has run under KV pressure at all;
+- a ToT search forks 15-21 contexts, which is what triggers eviction. The cache
+  is most likely to be silently cold exactly when the system is working hardest.
+
+Grep `TODO(kv-residency)` for the affected sites: `OpenOutcome` and the flush in
+`open_canonical` (`gen-core/src/boundary.rs`), the two driver log lines
+(`chat.rs`, `tree.rs`), and the crossmode/bon gate assertions (`run.sh`).
+
+**What is available without touching pie**, if this is picked up before the
+upstream API: time the flush in `open_canonical` and report `boundary_ms`
+beside `reused_tokens`. A resident boundary materializes only the appended
+suffix (near-zero, flat as the conversation grows); an evicted one runs a
+forward pass over the whole reused prefix. The pair discriminates. It is a
+timing heuristic rather than ground truth — load-sensitive, and it needs a
+prefix of real size to separate — and it cannot attribute a page drop to a
+specific snapshot or detect a partial replay. `kv_pages_used` is already on the
+wire via `model_status` and would give a coarse eviction signal for free. The
+higher-value piece is probably neither: a pressure gate that fills KV and
+asserts the run still answers correctly and only gets slower, since that
+exercises the risky path without observing residency at all.
 
 Recorded upstream fix: `find_eviction_victim` skips names in `active_snapshots`;
 `save`/`fork`/`take_inner` inherit the source bid.

@@ -68,10 +68,29 @@ impl Default for BoundaryDirective {
 ///
 /// `found` alone is NOT a hit signal. Scheduler eviction calls `suspend`
 /// (`runtime/context/sched.rs:790-815`) and leaves the name in place, so an
-/// evicted boundary **opens successfully and replays the whole prefix**. Until
-/// pie surfaces residency, `reused_tokens` is what a test should assert on —
-/// and a replay is invisible here, which is why the observability addition is
-/// tracked separately.
+/// evicted boundary **opens successfully and replays the whole prefix**.
+///
+/// TODO(kv-residency): every field here is NAME-level, not residency-level.
+/// `reused_tokens = 800` means a boundary with that name covered 800 tokens; it
+/// does NOT mean those tokens were on the GPU. Under memory pressure the same
+/// run re-prefills everything and these numbers are identical — so every reuse
+/// claim in this branch, including the milestone gates, is unfalsifiable in
+/// exactly the regime where it is most likely to be wrong. A ToT search forks
+/// 15-21 contexts, which is what triggers eviction in the first place.
+///
+/// The real fix is pie-side and deliberately NOT taken: `Context::open` returns
+/// `Result<Self>` (`sdk/rust/inferlet/src/context.rs:112`), which has no third
+/// state for "found, but I rebuilt it". It would need either an additive
+/// `open-with-report -> (context, report)` or a `snapshot-status(name)` query —
+/// the latter is cheaper and non-breaking but races, since status can change
+/// between the query and the open.
+///
+/// Without touching pie, the honest approximation is to measure what residency
+/// BUYS rather than ask for the state: time the flush in `open_canonical` (see
+/// the note there) and read it against `reused_tokens`. Large `reused_tokens`
+/// with a near-zero flush is a real hit; a flush that scales with it is a
+/// replay wearing a hit's clothes. That is a timing heuristic, not ground
+/// truth, and it needs a prefix of real size to separate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenOutcome {
     pub found: bool,
@@ -137,6 +156,13 @@ fn ladder(
 /// once up front materializes the pages, both forks inherit them, and
 /// `save_boundary`'s own flush degrades to a no-op. Token sequences — and so
 /// the digest — are unchanged either way; only the work is.
+///
+/// TODO(kv-residency): this flush is the one place a replay is observable
+/// without changing pie. On a genuinely resident boundary it materializes only
+/// the appended suffix — near-zero, and flat as the conversation grows. On an
+/// evicted one it runs a forward pass over the whole reused prefix. Timing it
+/// and reporting `boundary_ms` alongside `reused_tokens` would make the
+/// difference visible; nothing does that today.
 pub async fn open_canonical(
     model: &Model,
     model_id: &str,

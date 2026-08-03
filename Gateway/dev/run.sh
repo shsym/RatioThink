@@ -229,6 +229,14 @@ cmd_crossmode() {
   # turn 2 (ToT) must have REUSED, and turn 3 (chat) must have reused MORE than
   # turn 2 did — more means it hit the boundary ToT wrote, not a fallback to
   # the shallower one chat left in turn 1.
+  #
+  # TODO(kv-residency): this proves the NAMING is right, not that the KV was
+  # resident. An evicted boundary opens and replays, producing these exact
+  # numbers. The gate also runs on a quiet engine with one short conversation —
+  # the regime where eviction never fires — so it has never once exercised the
+  # failure it cannot detect. A pressure gate (fill KV, then assert the run
+  # still answers correctly and only gets slower) would cover that without
+  # needing anything from pie.
   local tot_reused chat_reused
   tot_reused=$(echo "$slice" | grep "tree kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
   chat_reused=$(echo "$slice" | grep "chat: kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
@@ -255,6 +263,9 @@ cmd_bon() {
   # Round 1 must have entered on chat's boundary, and the chat turn after the
   # commit must have reused MORE than that — more means it hit the boundary the
   # COMMIT wrote, not a fallback to the one chat left before the round.
+  #
+  # TODO(kv-residency): same limit as the crossmode gate — name-level, not
+  # residency-level. See gen_core::boundary::OpenOutcome.
   bon_reused=$(echo "$slice" | grep "route=best-of-n" | head -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
   chat_reused=$(echo "$slice" | grep "chat: kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
   [[ -n "$bon_reused" && "$bon_reused" -gt 0 ]] || { echo "❌ round 1 did not reuse chat's boundary (entry half)"; return 1; }

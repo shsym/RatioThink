@@ -374,6 +374,11 @@ async fn drive(
                             return;
                         }
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&r) {
+                            // TODO(kv-residency): as in chat.rs — `reused_tokens`
+                            // cannot distinguish a resident boundary from an
+                            // evicted one that replayed. A tree search forks
+                            // 15-21 contexts, so this is the route where the
+                            // distinction matters most and is least visible.
                             tracing::info!(
                                 %route,
                                 boundary_found = v.get("boundary_found").and_then(|b| b.as_bool()).unwrap_or(false),
