@@ -237,6 +237,22 @@ cmd_crossmode() {
   # failure it cannot detect. A pressure gate (fill KV, then assert the run
   # still answers correctly and only gets slower) would cover that without
   # needing anything from pie.
+  #
+  # PROBLEM — this gate FALSE-NEGATIVES on a reasoning model, and the failure
+  # is indistinguishable from a real cross-mode caching bug. `crossmode.py`
+  # budgets MAX_TOKENS (default 32) per chat turn and reads only `content`.
+  # A Qwen3.x-class model spends that budget inside its thinking block, so the
+  # reply comes back finish_reason=length with content="" and the reasoning in
+  # `reasoning_content`. Turn 1 then contributes an EMPTY assistant turn to the
+  # history, no ladder rung tokenizes to anything that was saved, and turn 2
+  # reports reused_tokens=0 — tripping the entry-half check below with the
+  # engine behaving perfectly. Observed 2026-08-02 on Qwen3.5-9B: identical run
+  # at MAX_TOKENS=512 goes 0 -> 18 with nothing else changed.
+  # Before believing a red entry half, check turn 1 actually printed an answer;
+  # `-> ''` means raise MAX_TOKENS, not that reuse is broken. `pie.real.toml`
+  # targets Qwen2.5-7B, which does not think, which is why the committed
+  # default was ever enough. Same hazard class as `make test-e2e-apc-divergence`
+  # ("a reasoning-stripping UI" forfeiting the history).
   local tot_reused chat_reused
   tot_reused=$(echo "$slice" | grep "tree kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
   chat_reused=$(echo "$slice" | grep "chat: kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
@@ -266,6 +282,10 @@ cmd_bon() {
   #
   # TODO(kv-residency): same limit as the crossmode gate — name-level, not
   # residency-level. See gen_core::boundary::OpenOutcome.
+  #
+  # PROBLEM: also inherits the crossmode gate's reasoning-model false negative —
+  # an empty turn-1 `content` trips the entry-half check below with the engine
+  # behaving correctly. See the note in cmd_crossmode; raise MAX_TOKENS.
   bon_reused=$(echo "$slice" | grep "route=best-of-n" | head -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
   chat_reused=$(echo "$slice" | grep "chat: kv reuse" | tail -1 | grep -oE "reused_tokens=[0-9]+" | cut -d= -f2)
   [[ -n "$bon_reused" && "$bon_reused" -gt 0 ]] || { echo "❌ round 1 did not reuse chat's boundary (entry half)"; return 1; }

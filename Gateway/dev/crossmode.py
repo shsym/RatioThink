@@ -1,6 +1,24 @@
-import json, urllib.request, sys
-BASE = "http://127.0.0.1:8100"
+import json, os, urllib.request, sys
+BASE = "http://127.0.0.1:%s" % os.environ.get("PORT", "8100")
 KEY = sys.argv[1] if len(sys.argv) > 1 else "b2-crossmode"
+# PROBLEM — 32 is only enough for a model that does NOT think first, and when
+# it is not enough this gate fails as if cross-mode caching were broken.
+#
+# A reasoning model (Qwen3.x) emits its thinking block before the answer. At 32
+# tokens the reply comes back finish_reason=length with the thinking in
+# `reasoning_content` and content="". `chat()` below reads only `content`, so
+# turn 1's answer is "" and the history handed to turn 2 carries an EMPTY
+# assistant turn. Boundaries are named by a digest over the tokenized prefix
+# (gen-core boundary.rs, SnapshotName::conv), so no ladder rung matches what
+# chat actually saved: turn 2 reports reused_tokens=0 and run.sh prints
+# "ToT did not reuse chat's boundary (entry half)" — pointing at the cache when
+# the real cause is the token budget.
+#
+# Observed 2026-08-02, Qwen3.5-9B: turn 1 -> '' and entry half 0 at 32; turn 1
+# -> '\n\nParis.' and entry half 18 at 512, nothing else changed. The committed
+# default survives only because pie.real.toml targets Qwen2.5-7B, which does
+# not think. If turn 1 prints `-> ''`, raise this — it is not a KV bug.
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32"))
 
 def post(path, body, stream=False):
     req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
@@ -13,7 +31,7 @@ def boundary(turn):
 
 def chat(msgs, turn, label):
     d = json.loads(post("/v1/chat/completions", {
-        "model": "qwen", "stream": False, "temperature": 0, "max_tokens": 32,
+        "model": "qwen", "stream": False, "temperature": 0, "max_tokens": MAX_TOKENS,
         "messages": msgs, "boundary": boundary(turn)}))
     txt = d["choices"][0]["message"]["content"]
     print(f"  {label}: prompt_tokens={d['usage']['prompt_tokens']}  -> {txt[:60]!r}")

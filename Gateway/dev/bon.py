@@ -17,12 +17,19 @@ riskier than the others: a conv/ boundary and another round's candidate must
 both be refused rather than deleted.
 """
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8100"
+BASE = "http://127.0.0.1:%s" % os.environ.get("PORT", "8100")
 KEY = sys.argv[1] if len(sys.argv) > 1 else "c-gate"
+# PROBLEM: a reasoning model spends this whole budget in its thinking block and
+# returns content="" (finish_reason=length), which leaves turn 1 with an empty
+# assistant turn and makes the entry-half check fail as if the cache were
+# broken. Full explanation in crossmode.py; if turn 1 prints `-> ''`, raise
+# this rather than hunting a KV bug.
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "32"))
 FAILURES = []
 
 
@@ -53,7 +60,7 @@ def chat(msgs, turn, label):
     _, raw = post(
         "/v1/chat/completions",
         {
-            "model": "qwen", "stream": False, "temperature": 0, "max_tokens": 32,
+            "model": "qwen", "stream": False, "temperature": 0, "max_tokens": MAX_TOKENS,
             "messages": msgs, "boundary": boundary(turn),
         },
     )
