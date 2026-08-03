@@ -31,6 +31,7 @@ let package = Package(
     .executable(name: "pie-resolve-probe", targets: ["pie-resolve-probe"]),
     .executable(name: "chat-engine-harness", targets: ["chat-engine-harness"]),
     .executable(name: "api-probe", targets: ["api-probe"]),
+    .executable(name: "bon-commit-body", targets: ["bon-commit-body"]),
   ],
   dependencies: [
     .package(url: "https://github.com/LebJe/TOMLKit", from: "0.6.0"),
@@ -68,6 +69,13 @@ let package = Package(
       name: "api-probe",
       dependencies: ["RatioThinkCore"],
       path: "Sources/api-probe"
+    ),
+    // Emits the real encoded Best-of-N commit body so a gate can POST Swift's
+    // own bytes rather than a hand-written approximation of them.
+    .executableTarget(
+      name: "bon-commit-body",
+      dependencies: ["RatioThinkCore"],
+      path: "Sources/bon-commit-body"
     ),
     .testTarget(
       name: "RatioThinkCoreTests",

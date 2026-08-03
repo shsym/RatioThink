@@ -1085,10 +1085,14 @@ public final class ChatSendController: ObservableObject {
     fileprivate let request: InferletRequest
     fileprivate let fallbackRelease: InferletRequest?
 
-    /// The encoded body, for the tests that pin the ordering invariant. The
-    /// bug this guards against is a body that LOOKS right and names a boundary
-    /// nothing asks for, so it can only be caught by reading the JSON.
-    var requestForTesting: InferletRequest { request }
+    /// The dispatch envelope this commit would send.
+    ///
+    /// Exposed so a gate can POST Swift's OWN bytes rather than a hand-written
+    /// approximation of them — see `Sources/bon-commit-body`. The bug this
+    /// guards against is a body that LOOKS right and names a boundary nothing
+    /// asks for, which no type-level agreement can catch: only encoding it and
+    /// putting it on the wire does.
+    public var dispatchRequest: InferletRequest { request }
   }
 
   /// Build the commit for `round`'s accepted `answer`. Call BEFORE committing

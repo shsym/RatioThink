@@ -269,16 +269,26 @@ cmd_bon() {
   echo "✅ C gate passed: round 1 reused $bon_reused (entry), warm think-more, chat after commit reused $chat_reused (exit)"
 }
 
-# The view's commit path: replay the EXACT body ChatScaffoldView now builds.
-# The Swift tests prove the body is assembled correctly (including the ordering
-# invariant — messages must NOT contain the accepted answer, since the guest
-# appends it); this proves the guest accepts that shape and that the boundary it
-# names is the one the next chat turn actually asks for.
+# The view's commit path, using SWIFT'S OWN BYTES.
+#
+# `bon-commit-body` runs `ChatSendController.prepareBestOfNCommit` — the code
+# path the view runs — and prints the complete dispatch envelope; the gate POSTs
+# it verbatim and derives the follow-up turn from the `messages`/`boundary` it
+# contains. Python contributes two prompt strings and the URL, nothing more.
+#
+# The earlier version hand-wrote an equivalent body in Python, so it and the
+# encoder were pinned together only by someone having read both — the same
+# construct-your-own-input gap that hid a think-more outage and a total
+# ToT/Best-of-N outage behind green gates.
 cmd_view_commit() {
   local key="${1:-view-commit-$$}"
   local log="${GATEWAY_LOG:-/tmp/view.log}"
   local before
   before=$(wc -l < "$log" 2>/dev/null || echo 0)
+  # The body comes from Swift, not from Python, so the emitter must be current.
+  command -v swift >/dev/null || { echo "error: swift not on PATH" >&2; return 1; }
+  ( cd "$REPO" && swift build --product bon-commit-body ) >/dev/null || {
+    echo "❌ could not build bon-commit-body"; return 1; }
   python3 "$REPO/Gateway/dev/view-commit.py" "$key" || return 1
   local slice reused
   slice=$(tail -n +$((before + 1)) "$log" | sed $'s/\033\[[0-9;]*m//g' | grep -E "kv reuse" || true)

@@ -174,7 +174,7 @@ final class BestOfNCommitEncodingTests: XCTestCase {
 
   private func body(_ prepared: ChatSendController.PreparedBestOfNCommit) throws -> [String: Any] {
     try XCTUnwrap(
-      JSONSerialization.jsonObject(with: prepared.requestForTesting.input) as? [String: Any])
+      JSONSerialization.jsonObject(with: prepared.dispatchRequest.input) as? [String: Any])
   }
 
   /// THE ordering invariant. The guest appends `assistant(answer)` itself, so a

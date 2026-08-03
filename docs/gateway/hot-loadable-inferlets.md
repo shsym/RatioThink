@@ -365,6 +365,18 @@ directory. Both scripts now DERIVE the list from which `Pie.toml` files declare
 a `[ratio]` table (which also excludes the legacy `chat-apc` monolith), and the
 bundle build fails if a declared inferlet does not stage.
 
+**The view-commit gate no longer writes a request body at all.**
+`Sources/bon-commit-body` runs `ChatSendController.prepareBestOfNCommit` — the
+code path the view runs — and prints the complete dispatch envelope; the gate
+runs a real round to get a candidate the guest actually minted, hands that in,
+POSTs Swift's bytes verbatim, and derives the follow-up chat turn from the
+`messages` and `boundary` inside them. Python contributes two prompt strings and
+the URL. Previously its hand-written body and the encoder were pinned together
+only by someone having read both. Verified as a negative control: dropping the
+`round_id` snake_case mapping from `BestOfNCommitInput.CodingKeys` — the exact
+milestone-A bug class — now fails the gate with a 400, where the old gate would
+have stayed green.
+
 **`run.sh endpoints`** is the new gate. It takes its routes from the SERVER's
 own `/v1/inferlets`, so a newly registered inferlet is covered without editing
 it, and it transcribes the CLIENT's routing rule as data — then asserts the two
