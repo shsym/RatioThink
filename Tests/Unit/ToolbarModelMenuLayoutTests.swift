@@ -30,7 +30,6 @@ final class ToolbarModelMenuLayoutTests: XCTestCase {
       annotation: "Profile default")
     let toolbar = ContentToolbar(
       viewModel: ChatTranscriptViewModel(),
-      availableProfiles: ["chat"],
       modelOptions: [],
       currentModelSummary: summary,
       swapCoordinator: .previewDefault(),
@@ -48,9 +47,10 @@ final class ToolbarModelMenuLayoutTests: XCTestCase {
 
   func test_toolbar_compresses_a_long_model_label() {
     let w = toolbarMinWidth(proposal: 400)
-    // Compressible: settles near the fixed chrome (profile menu + icons +
-    // padding ≈ a few hundred pt). A `.fixedSize()` regression jams it up by
-    // the full ~1000pt+ title. 800 cleanly separates the two.
+    // Compressible: settles near the fixed chrome (icons + padding ≈ a few
+    // hundred pt; the profile menu no longer contributes — it moved to the
+    // composer). A `.fixedSize()` regression jams it up by the full ~1000pt+
+    // title. 800 cleanly separates the two.
     XCTAssertLessThan(w, 800,
       "toolbar must compress a long model label under a 400pt proposal; got \(w)pt — " +
       "a `.fixedSize()` regression on the model menu label jams the minimum width wide")
