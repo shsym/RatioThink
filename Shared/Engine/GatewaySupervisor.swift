@@ -243,6 +243,9 @@ public actor GatewaySupervisor {
       return
     }
   }
+
+  func processIdentifierForTesting() -> Int32? { process?.processIdentifier }
+  func portFileForTesting() -> URL? { portFile }
 }
 
 /// Which backend serves `/v1/chat/completions`.
