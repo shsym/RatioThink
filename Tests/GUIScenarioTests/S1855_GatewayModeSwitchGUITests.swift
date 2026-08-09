@@ -64,10 +64,9 @@ final class S1855_GatewayModeSwitchGUITests: XCTestCase {
       .matching(identifier: "bestofn.inboundComment").firstMatch
     XCTAssertTrue(inbound.waitForExistence(timeout: 300),
                   "Best-of-N refinement did not produce a final round")
-    let finalOption = app.descendants(matching: .any)
-      .matching(identifier: "bestofn.option.0").firstMatch
-    XCTAssertTrue(finalOption.waitForExistence(timeout: 60),
-                  "Best-of-N final round did not expose a candidate")
+    let finalOption = app.buttons["bestofn.option.0"]
+    XCTAssertTrue(finalOption.waitForHittable(timeout: 300),
+                  "Best-of-N final round did not finish with a pickable candidate")
     finalOption.click()
 
     let disclosure = app.descendants(matching: .any)
