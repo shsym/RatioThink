@@ -81,11 +81,23 @@ fn send_response(ws: &mut WebSocket<TcpStream>, corr_id: u32, result: &str) {
 #[test]
 fn stdin_eof_forces_shutdown_with_an_open_stream() {
     let fake_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    fake_listener.set_nonblocking(true).unwrap();
     let fake_addr = fake_listener.local_addr().unwrap();
     let (stream_open_tx, stream_open_rx) = mpsc::channel();
     let fake_engine = thread::spawn(move || {
-        for _ in 0..2 {
-            let connection = fake_listener.accept().unwrap().0;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut accepted = 0;
+        while accepted < 2 && Instant::now() < deadline {
+            let connection = match fake_listener.accept() {
+                Ok((connection, _)) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("fake engine accept failed: {error}"),
+            };
+            connection.set_nonblocking(false).unwrap();
+            accepted += 1;
             let stream_open_tx = stream_open_tx.clone();
             thread::spawn(move || {
                 let mut ws = tungstenite::accept(connection).unwrap();
@@ -115,6 +127,7 @@ fn stdin_eof_forces_shutdown_with_an_open_stream() {
                 }
             });
         }
+        assert_eq!(accepted, 2, "gateway opened only {accepted} fake PIE connections");
     });
 
     let root = temp_dir();
