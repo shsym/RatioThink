@@ -56,36 +56,15 @@ SRCROOT="${SRCROOT:-$REPO_ROOT}"
 # CI/static verification mode: Xcode still type-checks and packages the app +
 # helper target, but the Rust pie engine build is the slow/runtime long pole.
 # This mode is intentionally opt-in and auditable; release/package targets must
-# leave it unset so the app bundle contains a real signed engine.
-if [[ "${PIE_SKIP_ENGINE_BUILD:-0}" == "1" ]]; then
-  echo "build-pie-engine.sh: PIE_SKIP_ENGINE_BUILD=1; skipping cargo pie engine build for compile-only/static verification"
+# build the engine even if the variable leaks through the ambient environment.
+if [[ -n "${PIE_SKIP_ENGINE_BUILD:-}" && "${PIE_SKIP_ENGINE_BUILD}" != "0" \
+      && "${CONFIGURATION:-}" != "Release" ]]; then
+  echo "build-pie-engine.sh: PIE_SKIP_ENGINE_BUILD=${PIE_SKIP_ENGINE_BUILD}; skipping engine build"
   exit 0
 fi
 
 if [[ -z "$ARCH" ]]; then
   # Xcode build-phase mode. $ARCHS is space-separated.
-  #
-  # Deterministic unit tier opt-out: the app-hosted xcodebuild bundles
-  # (RatioThinkTests via `make test-app-unit` / `test-xcode-chat-scaffold`)
-  # are headless and never launch the engine, but this phase still cargo-
-  # builds + restages + codesigns the engine into Rational.app. On a stale
-  # signed app that re-stage fails "Operation not permitted" (insight:483),
-  # and the multi-minute cargo build dwarfs the unit run. Set
-  # PIE_SKIP_ENGINE_BUILD=1 to no-op the phase.
-  #
-  # The DMG/release path (Scripts/package-dmg.sh) also runs THIS branch —
-  # it invokes xcodebuild without --arch, so the postCompile Run Script
-  # lands here, not the --arch CLI mode below. The skip reads ambient
-  # process env, which xcodebuild forwards into Run Script phases, so a
-  # globally-exported var would otherwise leak into a release build. Gate
-  # the skip mechanically on $CONFIGURATION (xcodebuild exports it into the
-  # phase): the unit recipes build Debug, package-dmg.sh builds Release, so
-  # this can never suppress the engine on the release/packaging path.
-  if [[ -n "${PIE_SKIP_ENGINE_BUILD:-}" && "${PIE_SKIP_ENGINE_BUILD}" != "0" \
-        && "${CONFIGURATION:-}" != "Release" ]]; then
-    echo "build-pie-engine.sh: PIE_SKIP_ENGINE_BUILD set — skipping engine build"
-    exit 0
-  fi
   # v1 explicitly ships arch-specific DMGs ( §5); universal-
   # binary support is deferred. A multi-arch invocation would stage
   # each arch to the same Resources/pie-engine/pie path and silently
