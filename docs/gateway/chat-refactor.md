@@ -25,9 +25,9 @@ shutdown closes that pipe and confirms the gateway is reaped before stopping
 PIE. The gateway removes its supervisor port file on every exit path.
 
 After readiness, liveness checks both the child process and `/healthz`. A dead
-or wedged gateway is restarted against the same healthy PIE engine and on the
-same published port. A failed recovery is surfaced as a session liveness
-failure; it never falls back silently to the legacy daemon backend.
+or wedged gateway is reported by name as a session liveness failure. Recovery
+restarts the complete PIE and gateway session, including reloading the model;
+it never falls back silently to the legacy daemon backend.
 
 Gateway mode does not call PIE's `launch_daemon`. Daemon mode remains an
 explicit alternative while migration is in progress.

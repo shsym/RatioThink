@@ -235,7 +235,8 @@ final class EngineStatusStoreTests: XCTestCase {
     let client = StubXPCClient()
     let store = EngineStatusStore(
       client: client,
-      daemonBindModeProvider: { .external }
+      daemonBindModeProvider: { .external },
+      chatBackendProvider: { .daemon }
     )
 
     try await store.startEngine(profileID: "chat")
@@ -245,6 +246,21 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(client.lastStartBindMode, .external,
                    "every production caller of startEngine(profileID:) must inherit the shared Local API bind preference")
     XCTAssertEqual(store.runtimeDaemonBindMode, .external)
+  }
+
+  func test_startEngine_gateway_without_modelOverride_uses_backendAwareSelector() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      chatBackendProvider: { .gateway }
+    )
+
+    try await store.startEngine(profileID: "chat")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertNil(client.lastStartModelOverride)
+    XCTAssertNil(client.lastStartBindMode)
   }
 
   func test_startEngine_explicit_external_bind_is_required_and_recorded() async throws {

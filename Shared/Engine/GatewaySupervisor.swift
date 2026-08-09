@@ -49,7 +49,6 @@ public actor GatewaySupervisor {
   private var process: Process?
   private var standardInput: Pipe?
   private var boundPort: UInt16?
-  private var publishedPort: UInt16?
   private var spec: Spec?
   private var portFile: URL?
   private var shutdownInProgress = false
@@ -73,9 +72,7 @@ public actor GatewaySupervisor {
       .appendingPathComponent("ratio-gateway-\(ProcessInfo.processInfo.processIdentifier).port")
     self.spec = spec
     self.portFile = portFile
-    let port = try await startProcess(spec: spec, port: 0, portFile: portFile)
-    publishedPort = port
-    return port
+    return try await startProcess(spec: spec, port: 0, portFile: portFile)
   }
 
   private func startProcess(spec: Spec, port: UInt16, portFile: URL) async throws -> UInt16 {
@@ -145,25 +142,6 @@ public actor GatewaySupervisor {
     guard let port = boundPort else { return nil } // pre-readiness; defer
     if await probeHealthz(port: port) { return nil }
     return "gateway /healthz unreachable on port \(port)"
-  }
-
-  /// Restarts only the gateway on its published port when PIE is still alive.
-  public func recoverIfNeeded() async -> String? {
-    guard let failure = await health() else { return nil }
-    guard !shutdownInProgress, shutdownResult == nil,
-          let spec, let port = publishedPort, let portFile
-    else { return failure }
-
-    let stopped = await stopCurrentProcess()
-    guard stopped.reaped else {
-      return "\(failure); gateway could not be reaped: \(stopped.message)"
-    }
-    do {
-      _ = try await startProcess(spec: spec, port: port, portFile: portFile)
-      return nil
-    } catch {
-      return "\(failure); gateway recovery failed: \(error)"
-    }
   }
 
   private func readPort(_ file: URL) -> UInt16? {

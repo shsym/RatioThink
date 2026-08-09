@@ -128,6 +128,7 @@ public final class EngineStatusStore: ObservableObject {
 
   private let client: any AppXPCClient
   private let daemonBindModeProvider: @MainActor @Sendable () -> EngineHTTPBindMode
+  private let chatBackendProvider: @MainActor @Sendable () -> ChatBackend
   private let activeProfileIDProvider: @MainActor @Sendable () -> String?
   /// Fast cadence — the interval used while the engine state is actively
   /// changing (transition tier: `.starting`/`.stopping`, an engine-death or
@@ -230,6 +231,9 @@ public final class EngineStatusStore: ObservableObject {
     initialStatus: EngineStatus = .starting,
     initialDaemonBindMode: EngineHTTPBindMode = .loopback,
     daemonBindModeProvider: @escaping @MainActor @Sendable () -> EngineHTTPBindMode = { .loopback },
+    chatBackendProvider: @escaping @MainActor @Sendable () -> ChatBackend = {
+      ChatBackend.fromEnvironment()
+    },
     activeProfileIDProvider: @escaping @MainActor @Sendable () -> String? = { nil },
     tierPolicy: StatusTierPolicy = StatusTierPolicy(),
     now: @escaping @Sendable () -> Date = { Date() },
@@ -239,6 +243,7 @@ public final class EngineStatusStore: ObservableObject {
   ) {
     self.client = client
     self.daemonBindModeProvider = daemonBindModeProvider
+    self.chatBackendProvider = chatBackendProvider
     self.activeProfileIDProvider = activeProfileIDProvider
     self.pollInterval = pollInterval
     self.steadyPollInterval = steadyPollInterval
@@ -692,12 +697,11 @@ public final class EngineStatusStore: ObservableObject {
     beginStartConvergence(deadline: now().addingTimeInterval(Self.startConvergenceBudget))
     let requestedBindMode = daemonBindHost ?? daemonBindModeProvider()
     do {
-      if let modelOverride {
+      if modelOverride != nil || chatBackendProvider() == .gateway {
         // Model-pick start: the helper resolver injects the persisted Local
-        // API bind mode into the spec, so this start still honors the user's
-        // exposure preference even though the model-override wire selector
-        // carries no explicit bind host. Record the shared preference as the
-        // optimistic runtime posture (it matches what the resolver injects).
+        // API bind mode into the spec. Gateway starts use this backend-aware
+        // selector even without an override; the bind-host selector carries
+        // only daemon intent.
         try await client.startEngine(profileID: profileID, modelOverride: modelOverride)
       } else {
         try await client.startEngine(profileID: profileID, daemonBindHost: requestedBindMode)
