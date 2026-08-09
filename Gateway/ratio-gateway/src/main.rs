@@ -13,7 +13,9 @@ use registry::Registry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use tokio::time::Duration;
+use tokio::time::{Duration, timeout};
+
+const STDIN_EOF_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
 #[command(about = "HTTP/SSE gateway for the PIE engine")]
@@ -166,7 +168,23 @@ async fn main() -> Result<()> {
 
     let server = axum::serve(listener, routes::router(state));
     if args.exit_on_stdin_eof {
-        server.with_graceful_shutdown(stdin_eof()).await?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let graceful = server
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .into_future();
+        tokio::pin!(graceful);
+        tokio::select! {
+            result = &mut graceful => result?,
+            _ = stdin_eof() => {
+                let _ = shutdown_tx.send(());
+                match timeout(STDIN_EOF_SHUTDOWN_GRACE, &mut graceful).await {
+                    Ok(result) => result?,
+                    Err(_) => tracing::warn!("forcing shutdown with active connections"),
+                }
+            }
+        }
     } else {
         server.await?;
     }

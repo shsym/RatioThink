@@ -462,6 +462,42 @@ impl Drop for CancelOnDrop {
     }
 }
 
+pub struct TerminateProcessOnDrop {
+    client: Arc<Client>,
+    process_id: Option<String>,
+}
+
+impl TerminateProcessOnDrop {
+    pub fn new(client: Arc<Client>, process: &Process) -> Self {
+        Self {
+            client,
+            process_id: Some(process.id().to_string()),
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.process_id = None;
+    }
+
+    pub async fn terminate(&mut self) {
+        if let Some(process_id) = self.process_id.take() {
+            let _ = self.client.terminate_process(&process_id).await;
+        }
+    }
+}
+
+impl Drop for TerminateProcessOnDrop {
+    fn drop(&mut self) {
+        let Some(process_id) = self.process_id.take() else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        tokio::spawn(async move {
+            let _ = client.terminate_process(&process_id).await;
+        });
+    }
+}
+
 /// Owns the `Process` and selects between its events and cancellation.
 /// `Process::signal` lives on `Process`, not `Client`, which is why the process
 /// must be owned here rather than reached from the drop guard.
@@ -473,6 +509,7 @@ async fn drive(
     mut seq: SeqChecker,
     grace: Duration,
 ) {
+    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
     loop {
         tokio::select! {
             _ = &mut cancel_rx => {
@@ -500,7 +537,7 @@ async fn drive(
                 );
                 // Authoritative: dropping the client only detaches
                 // (server.rs:400-403), so the process would keep running.
-                let _ = client.terminate_process(proc.id()).await;
+                termination.terminate().await;
                 let _ = tx.send(Frame::Done).await;
                 return;
             }
@@ -512,11 +549,14 @@ async fn drive(
                         }
                         Err(pe) => {
                             let _ = tx.send(Frame::Fault(pe.to_string())).await;
-                            let _ = client.terminate_process(proc.id()).await;
+                            termination.terminate().await;
                             break;
                         }
                     },
-                    Ok(ProcessEvent::Return(_)) => break,
+                    Ok(ProcessEvent::Return(_)) => {
+                        termination.disarm();
+                        break;
+                    }
                     Ok(ProcessEvent::Error(e)) => {
                         let _ = tx.send(Frame::Fault(e)).await;
                         break;

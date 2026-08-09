@@ -4,7 +4,7 @@
 //! It parses only routing/transport fields and forwards the body untouched —
 //! `gen-core` owns request semantics.
 
-use crate::routes::AppState;
+use crate::routes::{AppState, TerminateProcessOnDrop};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
@@ -191,7 +191,15 @@ pub async fn chat_completions(
                         let _ = client.terminate_process(proc.id()).await;
                         return api_error(status_for(&code), &code, &message);
                     }
-                    Ok(_) | Err(_) => {}
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(pe) => {
+                        let _ = client.terminate_process(proc.id()).await;
+                        return api_error(
+                            StatusCode::BAD_GATEWAY,
+                            "protocol_error",
+                            &pe.to_string(),
+                        );
+                    }
                 }
             }
             Ok(Ok(_)) => {}
@@ -280,14 +288,35 @@ async fn buffered_response(
     created: i64,
     started: Instant,
 ) -> Response {
+    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
     let mut result: Option<GenResult> = None;
     let mut err: Option<(String, String)> = None;
     loop {
         match proc.recv().await {
             Ok(ProcessEvent::Message(m)) => {
-                if let Ok(env) = seq.accept(&m) {
-                    if let Ok(Some(Event::Error { code, message, .. })) = env.decode_event() {
+                let env = match seq.accept(&m) {
+                    Ok(env) => env,
+                    Err(pe) => {
+                        termination.terminate().await;
+                        return api_error(
+                            StatusCode::BAD_GATEWAY,
+                            "protocol_error",
+                            &pe.to_string(),
+                        );
+                    }
+                };
+                match env.decode_event() {
+                    Ok(Some(Event::Error { code, message, .. })) => {
                         err = Some((code, message));
+                    }
+                    Ok(_) => {}
+                    Err(pe) => {
+                        termination.terminate().await;
+                        return api_error(
+                            StatusCode::BAD_GATEWAY,
+                            "protocol_error",
+                            &pe.to_string(),
+                        );
                     }
                 }
             }
@@ -320,7 +349,7 @@ async fn buffered_response(
             }
         }
     }
-    let _ = client.terminate_process(proc.id()).await;
+    termination.terminate().await;
     let _ = started;
 
     // An `Error` event alongside a `GenResult` means the generation ABORTED.

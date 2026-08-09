@@ -14,7 +14,7 @@
 
 use crate::chat::{api_error, status_for};
 use ratio_wire::RunInput;
-use crate::routes::{AppState, CancelOnDrop};
+use crate::routes::{AppState, CancelOnDrop, TerminateProcessOnDrop};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
@@ -189,10 +189,19 @@ pub async fn dispatch(
                             param.as_deref(),
                         );
                     }
+                    Ok(Some(Event::Warning { .. })) => continue,
                     Ok(Some(ev)) => break ev,
-                    // Warnings and unknown-tag frames are ignorable; keep
-                    // waiting for something that commits.
-                    Ok(None) | Err(_) => continue,
+                    // Unknown-tag frames are forward-compatible; malformed
+                    // known events are protocol failures.
+                    Ok(None) => continue,
+                    Err(pe) => {
+                        let _ = client.terminate_process(proc.id()).await;
+                        return api_error(
+                            StatusCode::BAD_GATEWAY,
+                            "protocol_error",
+                            &pe.to_string(),
+                        );
+                    }
                 }
             }
             Ok(Ok(_)) => continue,
@@ -281,6 +290,7 @@ async fn drive(
     route: String,
 ) {
     let pid = proc.id().to_string();
+    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
     let mut terminal_seen = false;
     loop {
         tokio::select! {
@@ -304,7 +314,7 @@ async fn drive(
                     "terminating tree process"
                 );
                 // Authoritative: dropping the client only detaches.
-                let _ = client.terminate_process(proc.id()).await;
+                termination.terminate().await;
                 let _ = tx.send(Frame::Done).await;
                 return;
             }
@@ -315,7 +325,7 @@ async fn drive(
                             Ok(e) => e,
                             Err(pe) => {
                                 let _ = tx.send(Frame::Fault("protocol_error".into(), pe.to_string())).await;
-                                let _ = client.terminate_process(proc.id()).await;
+                                termination.terminate().await;
                                 return;
                             }
                         };
@@ -344,6 +354,7 @@ async fn drive(
                     // otherwise unobservable — without them a ToT path that
                     // cold-starts every turn looks identical to one that reuses.
                     Ok(ProcessEvent::Return(r)) => {
+                        termination.disarm();
                         if !terminal_seen {
                             // The guest returned without a terminal event, so
                             // the stream would otherwise end on a bare [DONE]
@@ -489,10 +500,11 @@ async fn unary_response(
     mut seq: SeqChecker,
     first_event_timeout: Duration,
 ) -> Response {
+    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
     loop {
         match timeout(first_event_timeout, proc.recv()).await {
             Err(_) => {
-                let _ = client.terminate_process(proc.id()).await;
+                termination.terminate().await;
                 return api_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     "inferlet_timeout",
@@ -511,9 +523,20 @@ async fn unary_response(
                 // `param: "round_id"` / `"commit.snapshot_name"`, and losing it
                 // makes an authorization refusal indistinguishable from a
                 // generic 400.
-                if let Ok(env) = seq.accept(&m) {
-                    if let Ok(Some(Event::Error { code, message, param })) = env.decode_event() {
-                        let _ = client.terminate_process(proc.id()).await;
+                let env = match seq.accept(&m) {
+                    Ok(env) => env,
+                    Err(pe) => {
+                        termination.terminate().await;
+                        return api_error(
+                            StatusCode::BAD_GATEWAY,
+                            "protocol_error",
+                            &pe.to_string(),
+                        );
+                    }
+                };
+                match env.decode_event() {
+                    Ok(Some(Event::Error { code, message, param })) => {
+                        termination.terminate().await;
                         return api_error_param(
                             status_for(&code),
                             &code,
@@ -521,9 +544,19 @@ async fn unary_response(
                             param.as_deref(),
                         );
                     }
+                    Ok(_) => {}
+                    Err(pe) => {
+                        termination.terminate().await;
+                        return api_error(
+                            StatusCode::BAD_GATEWAY,
+                            "protocol_error",
+                            &pe.to_string(),
+                        );
+                    }
                 }
             }
             Ok(Ok(ProcessEvent::Return(r))) => {
+                termination.disarm();
                 let body: serde_json::Value =
                     serde_json::from_str(&r).unwrap_or(serde_json::Value::Null);
                 if body.is_null() || body.as_object().is_some_and(|o| o.is_empty()) {

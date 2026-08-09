@@ -1291,6 +1291,7 @@ dependencies = [
  "pie-client",
  "ratio-wire",
  "regex",
+ "rmp-serde",
  "serde",
  "serde_json",
  "sha2",
@@ -1299,6 +1300,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
  "uuid",
 ]
 
