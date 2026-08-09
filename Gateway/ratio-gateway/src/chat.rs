@@ -5,11 +5,11 @@
 //! `gen-core` owns request semantics.
 
 use crate::routes::{AppState, TerminateProcessOnDrop};
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use pie_client::client::{Client, Process, ProcessEvent};
 use ratio_wire::{Event, GenResult, OpenAiSse, RunInput, SeqChecker};
 use serde_json::json;
@@ -52,7 +52,8 @@ pub fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     // The app's retry ladder keys on Retry-After for over-capacity; without it
     // a 503 is treated as a hard failure instead of a backoff.
     if status == StatusCode::SERVICE_UNAVAILABLE {
-        resp.headers_mut().insert("Retry-After", axum::http::HeaderValue::from_static("1"));
+        resp.headers_mut()
+            .insert("Retry-After", axum::http::HeaderValue::from_static("1"));
     }
     resp
 }
@@ -79,7 +80,11 @@ pub async fn chat_completions(
 ) -> Response {
     // ---- pre-commit ----
     if body.len() > CHAT_MAX_BODY {
-        return api_error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", "body too large");
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "body too large",
+        );
     }
     let raw: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -115,7 +120,11 @@ pub async fn chat_completions(
 
     // Only routing/transport fields are read here. Everything else — roles,
     // sampling bounds, cue mode — belongs to gen-core.
-    let model = raw.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let model = raw
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
     let stream = raw.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let include_usage = raw
         .get("stream_options")
@@ -137,13 +146,23 @@ pub async fn chat_completions(
     };
     let input = match serde_json::to_string(&run_input) {
         Ok(s) => s,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_failed", &e.to_string()),
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encode_failed",
+                &e.to_string(),
+            );
+        }
     };
 
     let client = match st.engine.request_client().await {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            return api_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", &e.to_string());
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine_unavailable",
+                &e.to_string(),
+            );
         }
     };
     let mut proc = match client
@@ -163,22 +182,38 @@ pub async fn chat_completions(
         match timeout(st.first_event_timeout, proc.recv()).await {
             Err(_) => {
                 let _ = client.terminate_process(proc.id()).await;
-                return api_error(StatusCode::GATEWAY_TIMEOUT, "inferlet_start_timeout", "no ready");
+                return api_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "inferlet_start_timeout",
+                    "no ready",
+                );
             }
             Ok(Err(e)) => {
-                return api_error(StatusCode::BAD_GATEWAY, "engine_stream_closed", &e.to_string());
+                return api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "engine_stream_closed",
+                    &e.to_string(),
+                );
             }
             Ok(Ok(ProcessEvent::Error(e))) => {
                 return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
             }
             Ok(Ok(ProcessEvent::Return(_))) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "no_output", "returned before ready");
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "no_output",
+                    "returned before ready",
+                );
             }
             Ok(Ok(ProcessEvent::Message(m))) => {
                 let env = match seq.accept(&m) {
                     Ok(e) => e,
                     Err(pe) => {
-                        return api_error(StatusCode::BAD_GATEWAY, "protocol_error", &pe.to_string());
+                        return api_error(
+                            StatusCode::BAD_GATEWAY,
+                            "protocol_error",
+                            &pe.to_string(),
+                        );
                     }
                 };
                 match env.decode_event() {
@@ -207,8 +242,18 @@ pub async fn chat_completions(
     }
 
     if stream {
-        stream_response(st, client, proc, seq, pre_warnings, request_id, model, created,
-                        include_usage, started)
+        stream_response(
+            st,
+            client,
+            proc,
+            seq,
+            pre_warnings,
+            request_id,
+            model,
+            created,
+            include_usage,
+            started,
+        )
     } else {
         buffered_response(client, proc, seq, request_id, model, created, started).await
     }
@@ -229,7 +274,15 @@ fn stream_response(
 ) -> Response {
     let (tx, mut rx) = mpsc::channel::<Frame>(256);
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    tokio::spawn(drive(proc, Arc::clone(&client), tx, cancel_rx, seq, st.cancel_grace, started));
+    tokio::spawn(drive(
+        proc,
+        Arc::clone(&client),
+        tx,
+        cancel_rx,
+        seq,
+        st.cancel_grace,
+        started,
+    ));
 
     let guard = crate::routes::CancelOnDrop(Some(cancel_tx));
     let mut r = OpenAiSse::new(id, model, created).with_usage_chunk(include_usage);
@@ -437,7 +490,11 @@ async fn drive(
         match ev {
             Ok(ProcessEvent::Message(m)) => match seq.accept(&m) {
                 Ok(env) => match env.decode_event() {
-                    Ok(Some(Event::Usage { prompt_tokens, completion_tokens, context_window })) => {
+                    Ok(Some(Event::Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        context_window,
+                    })) => {
                         usage = Some(ratio_wire::UsageCounts {
                             prompt_tokens,
                             completion_tokens,
@@ -488,9 +545,14 @@ async fn drive(
         while Instant::now() < deadline {
             match timeout(deadline - Instant::now(), proc.recv()).await {
                 Ok(Ok(ProcessEvent::Message(m))) => {
-                    if m.contains(r#""t":"finish""#) { guest_stopped = true; }
+                    if m.contains(r#""t":"finish""#) {
+                        guest_stopped = true;
+                    }
                 }
-                Ok(Ok(ProcessEvent::Return(_))) => { guest_stopped = true; break }
+                Ok(Ok(ProcessEvent::Return(_))) => {
+                    guest_stopped = true;
+                    break;
+                }
                 Ok(Ok(ProcessEvent::Error(_))) => break,
                 Ok(Ok(_)) => continue,
                 _ => break,
@@ -528,5 +590,12 @@ async fn drive(
         output_tokens: u.completion_tokens,
         elapsed_s: started.elapsed().as_secs_f64(),
     });
-    let _ = tx.send(Frame::Terminal { reason, usage, metrics, error }).await;
+    let _ = tx
+        .send(Frame::Terminal {
+            reason,
+            usage,
+            metrics,
+            error,
+        })
+        .await;
 }

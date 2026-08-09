@@ -32,7 +32,11 @@ fn parse_token(line: &str) -> Option<String> {
 
 impl Engine {
     pub fn attach(url: String, token: String) -> Self {
-        Self { url, token, _child: None }
+        Self {
+            url,
+            token,
+            _child: None,
+        }
     }
 
     /// Dev mode. `--debug` is mandatory: without it `server.verbose` stays
@@ -51,7 +55,10 @@ impl Engine {
             .spawn()
             .with_context(|| format!("failed to spawn {}", pie_bin.display()))?;
 
-        let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("no stderr pipe"))?;
         let mut lines = BufReader::new(stderr).lines();
         let (mut addr, mut token) = (None, None);
 
@@ -90,7 +97,9 @@ impl Engine {
     /// One long-lived control client for boot-time work only. It must never
     /// carry process events — those go on per-request connections (§8.2).
     pub async fn control_client(&self) -> Result<Client> {
-        let c = Client::connect(&self.url).await.context("control connect")?;
+        let c = Client::connect(&self.url)
+            .await
+            .context("control connect")?;
         c.auth_by_token(&self.token).await.context("control auth")?;
         Ok(c)
     }

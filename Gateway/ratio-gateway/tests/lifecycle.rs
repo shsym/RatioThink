@@ -60,7 +60,10 @@ fn stdin_eof_stops_gateway_and_removes_port_file() {
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
-    let status = child.try_wait().unwrap().expect("gateway did not exit on stdin EOF");
+    let status = child
+        .try_wait()
+        .unwrap()
+        .expect("gateway did not exit on stdin EOF");
     assert!(status.success());
     assert!(!port_file.exists(), "gateway left its port file behind");
     fs::remove_dir_all(root).unwrap();
@@ -127,7 +130,10 @@ fn stdin_eof_forces_shutdown_with_an_open_stream() {
                 }
             });
         }
-        assert_eq!(accepted, 2, "gateway opened only {accepted} fake PIE connections");
+        assert_eq!(
+            accepted, 2,
+            "gateway opened only {accepted} fake PIE connections"
+        );
     });
 
     let root = temp_dir();
@@ -176,7 +182,10 @@ fn stdin_eof_forces_shutdown_with_an_open_stream() {
     let mut response = [0_u8; 2048];
     let read = http.read(&mut response).unwrap();
     let response = String::from_utf8_lossy(&response[..read]);
-    assert!(response.contains("200 OK"), "stream did not open: {response}");
+    assert!(
+        response.contains("200 OK"),
+        "stream did not open: {response}"
+    );
 
     drop(child.stdin.take());
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -190,7 +199,10 @@ fn stdin_eof_forces_shutdown_with_an_open_stream() {
         child.kill().unwrap();
         child.wait().unwrap();
     }
-    assert!(exited.is_some(), "gateway did not force shutdown with an open stream");
+    assert!(
+        exited.is_some(),
+        "gateway did not force shutdown with an open stream"
+    );
     assert!(!port_file.exists(), "gateway left its port file behind");
     fs::remove_dir_all(root).unwrap();
 }
