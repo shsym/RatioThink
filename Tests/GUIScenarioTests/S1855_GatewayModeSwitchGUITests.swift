@@ -64,11 +64,20 @@ final class S1855_GatewayModeSwitchGUITests: XCTestCase {
       .matching(identifier: "bestofn.inboundComment").firstMatch
     XCTAssertTrue(inbound.waitForExistence(timeout: 300),
                   "Best-of-N refinement did not produce a final round")
-    XCTAssertTrue(firstOption.waitForExistence(timeout: 60),
+    let finalOption = app.descendants(matching: .any)
+      .matching(identifier: "bestofn.option.0").firstMatch
+    XCTAssertTrue(finalOption.waitForExistence(timeout: 60),
                   "Best-of-N final round did not expose a candidate")
-    firstOption.click()
-    XCTAssertTrue(waitForAbsence(firstOption, timeout: 30),
-                  "Best-of-N final pick was not committed")
+    finalOption.click()
+
+    let disclosure = app.descendants(matching: .any)
+      .matching(identifier: "bestofn.disclosure").firstMatch
+    XCTAssertTrue(disclosure.waitForExistence(timeout: 30),
+                  "Best-of-N final pick did not leave committed options history")
+    let visibleOption = app.descendants(matching: .any)
+      .matching(identifier: "bestofn.option.0").firstMatch
+    XCTAssertTrue(waitForAbsence(visibleOption, timeout: 30),
+                  "Best-of-N committed options did not fold")
   }
 
   @MainActor
