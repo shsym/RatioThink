@@ -4,13 +4,13 @@ use crate::engine::Engine;
 use crate::registry::{Entry, Installed, Registry};
 // Envelope + sequence contract come from the shared crate, so the gateway
 // and the inferlets cannot drift apart.
+use ratio_wire::{ProtocolError, SeqChecker};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::get, routing::post};
 use pie_client::client::{Client, Process, ProcessEvent};
-use ratio_wire::{ProtocolError, SeqChecker};
 use serde_json::json;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -90,12 +90,8 @@ impl AppState {
         if let Some(m) = &self.model_override {
             return vec![m.clone()];
         }
-        let Ok(c) = self.engine.control_client().await else {
-            return vec![];
-        };
-        let Ok(raw) = c.query("model_status", "{}".to_string()).await else {
-            return vec![];
-        };
+        let Ok(c) = self.engine.control_client().await else { return vec![] };
+        let Ok(raw) = c.query("model_status", "{}".to_string()).await else { return vec![] };
         serde_json::from_str::<serde_json::Value>(&raw)
             .ok()
             .and_then(|v| v.as_object().cloned())
@@ -255,10 +251,7 @@ async fn reload(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
     // rest reinstalls on next use, since `Installed` keys on the digest.
     let mut changed = Vec::new();
     for e in next.entries() {
-        let was = before
-            .iter()
-            .find(|(r, _)| *r == e.route)
-            .map(|(_, d)| d.as_str());
+        let was = before.iter().find(|(r, _)| *r == e.route).map(|(_, d)| d.as_str());
         if was != Some(e.digest.as_str()) {
             changed.push(json!({"route": e.route, "from": was, "to": e.digest}));
             if e.preload {
@@ -289,11 +282,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 async fn inferlet_dispatch(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
     let name = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
-        .and_then(|v| {
-            v.get("inferlet")
-                .and_then(|s| s.as_str())
-                .map(str::to_string)
-        })
+        .and_then(|v| v.get("inferlet").and_then(|s| s.as_str()).map(str::to_string))
         .unwrap_or_default();
     if name.is_empty() {
         return api_error(
@@ -359,8 +348,7 @@ pub fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     // The app's retry ladder keys on Retry-After for over-capacity; without it
     // a 503 is treated as a hard failure instead of a backoff.
     if status == StatusCode::SERVICE_UNAVAILABLE {
-        resp.headers_mut()
-            .insert("Retry-After", axum::http::HeaderValue::from_static("1"));
+        resp.headers_mut().insert("Retry-After", axum::http::HeaderValue::from_static("1"));
     }
     resp
 }
@@ -392,21 +380,12 @@ async fn echo(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Respo
     let client = match st.engine.request_client().await {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "engine_unavailable",
-                &e.to_string(),
-            );
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", &e.to_string());
         }
     };
 
     let mut proc = match client
-        .launch_process(
-            entry.program.clone(),
-            input,
-            /* capture_outputs */ true,
-            None,
-        )
+        .launch_process(entry.program.clone(), input, /* capture_outputs */ true, None)
         .await
     {
         Ok(p) => p,
@@ -419,28 +398,14 @@ async fn echo(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Respo
     let first = match timeout(st.first_event_timeout, proc.recv()).await {
         Err(_) => {
             let _ = client.terminate_process(proc.id()).await;
-            return api_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                "inferlet_start_timeout",
-                "no first event",
-            );
+            return api_error(StatusCode::GATEWAY_TIMEOUT, "inferlet_start_timeout", "no first event");
         }
-        Ok(Err(e)) => {
-            return api_error(
-                StatusCode::BAD_GATEWAY,
-                "engine_stream_closed",
-                &e.to_string(),
-            );
-        }
+        Ok(Err(e)) => return api_error(StatusCode::BAD_GATEWAY, "engine_stream_closed", &e.to_string()),
         Ok(Ok(ProcessEvent::Error(e))) => {
             return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
         }
         Ok(Ok(ProcessEvent::Return(_))) => {
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "no_output",
-                "returned without emitting",
-            );
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "no_output", "returned without emitting");
         }
         Ok(Ok(ProcessEvent::Message(m))) => match seq.accept(&m) {
             Ok(_) => m,
@@ -456,14 +421,7 @@ async fn echo(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Respo
     if !first.is_empty() {
         let _ = tx.send(Frame::Data(first)).await;
     }
-    tokio::spawn(drive(
-        proc,
-        Arc::clone(&client),
-        tx,
-        cancel_rx,
-        seq,
-        st.cancel_grace,
-    ));
+    tokio::spawn(drive(proc, Arc::clone(&client), tx, cancel_rx, seq, st.cancel_grace));
 
     // Dropping the guard (client hung up, or normal completion) tells the
     // driver to cancel. This is the backpressure mechanism, not just hygiene:

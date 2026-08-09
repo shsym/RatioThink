@@ -170,8 +170,8 @@ impl Registry {
 }
 
 fn parse_entry(wasm: &Path, manifest: &Path) -> Result<Entry> {
-    let manifest_bytes =
-        std::fs::read(manifest).with_context(|| format!("cannot read {}", manifest.display()))?;
+    let manifest_bytes = std::fs::read(manifest)
+        .with_context(|| format!("cannot read {}", manifest.display()))?;
     let wasm_bytes =
         std::fs::read(wasm).with_context(|| format!("cannot read {}", wasm.display()))?;
 
@@ -330,19 +330,9 @@ preload = true
     fn digest_changes_when_the_wasm_changes() {
         let d = tmp();
         write(&d, "echo", b"\0asm-v1", ECHO);
-        let a = Registry::scan(&d)
-            .unwrap()
-            .get("echo")
-            .unwrap()
-            .digest
-            .clone();
+        let a = Registry::scan(&d).unwrap().get("echo").unwrap().digest.clone();
         write(&d, "echo", b"\0asm-v2", ECHO);
-        let b = Registry::scan(&d)
-            .unwrap()
-            .get("echo")
-            .unwrap()
-            .digest
-            .clone();
+        let b = Registry::scan(&d).unwrap().get("echo").unwrap().digest.clone();
         assert_ne!(a, b, "changed bytes must produce a new version identity");
     }
 
@@ -350,37 +340,17 @@ preload = true
     fn digest_changes_when_only_the_manifest_changes() {
         let d = tmp();
         write(&d, "echo", b"\0asm", ECHO);
-        let a = Registry::scan(&d)
-            .unwrap()
-            .get("echo")
-            .unwrap()
-            .digest
-            .clone();
+        let a = Registry::scan(&d).unwrap().get("echo").unwrap().digest.clone();
         write(&d, "echo", b"\0asm", &ECHO.replace("0.1.0", "0.1.1"));
-        let b = Registry::scan(&d)
-            .unwrap()
-            .get("echo")
-            .unwrap()
-            .digest
-            .clone();
+        let b = Registry::scan(&d).unwrap().get("echo").unwrap().digest.clone();
         assert_ne!(a, b);
     }
 
     #[test]
     fn duplicate_route_is_rejected() {
         let d = tmp();
-        write(
-            &d,
-            "a",
-            b"\0asm",
-            "[package]\nname=\"a\"\nversion=\"1\"\n[ratio]\nroute=\"same\"\n",
-        );
-        write(
-            &d,
-            "b",
-            b"\0asm",
-            "[package]\nname=\"b\"\nversion=\"1\"\n[ratio]\nroute=\"same\"\n",
-        );
+        write(&d, "a", b"\0asm", "[package]\nname=\"a\"\nversion=\"1\"\n[ratio]\nroute=\"same\"\n");
+        write(&d, "b", b"\0asm", "[package]\nname=\"b\"\nversion=\"1\"\n[ratio]\nroute=\"same\"\n");
         let err = Registry::scan(&d).unwrap_err().to_string();
         assert!(err.contains("duplicate route"), "got: {err}");
     }
@@ -388,18 +358,8 @@ preload = true
     #[test]
     fn duplicate_program_id_is_rejected() {
         let d = tmp();
-        write(
-            &d,
-            "a",
-            b"\0asm",
-            "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nroute=\"a\"\n",
-        );
-        write(
-            &d,
-            "b",
-            b"\0asm",
-            "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nroute=\"b\"\n",
-        );
+        write(&d, "a", b"\0asm", "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nroute=\"a\"\n");
+        write(&d, "b", b"\0asm", "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nroute=\"b\"\n");
         let err = Registry::scan(&d).unwrap_err().to_string();
         assert!(err.contains("duplicate program id"), "got: {err}");
     }
@@ -408,23 +368,13 @@ preload = true
     fn missing_manifest_is_rejected() {
         let d = tmp();
         std::fs::File::create(d.join("lonely.wasm")).unwrap();
-        assert!(
-            Registry::scan(&d)
-                .unwrap_err()
-                .to_string()
-                .contains("no matching")
-        );
+        assert!(Registry::scan(&d).unwrap_err().to_string().contains("no matching"));
     }
 
     #[test]
     fn unknown_protocol_is_rejected_rather_than_defaulted() {
         let d = tmp();
-        write(
-            &d,
-            "x",
-            b"\0asm",
-            "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nprotocol=\"telepathy-v9\"\n",
-        );
+        write(&d, "x", b"\0asm", "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nprotocol=\"telepathy-v9\"\n");
         // `{:#}` renders the whole context chain; the cause is one layer in, and
         // the message must name the offending file so the fix is obvious.
         let err = format!("{:#}", Registry::scan(&d).unwrap_err());
@@ -480,10 +430,7 @@ preload = true
             "[package]\nname=\"chat\"\nversion=\"0.1.0\"\n[ratio]\naliases=[\"chat-apc\"]\n",
         );
         let r = Registry::scan(&d).unwrap();
-        assert_eq!(
-            r.get("chat").unwrap().program,
-            r.get("chat-apc").unwrap().program
-        );
+        assert_eq!(r.get("chat").unwrap().program, r.get("chat-apc").unwrap().program);
         assert_eq!(r.entries().count(), 1, "an alias must not preload twice");
         assert_eq!(r.routes(), vec!["chat".to_string(), "chat-apc".to_string()]);
     }
