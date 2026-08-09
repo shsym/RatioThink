@@ -18,7 +18,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUTER="$(cd "$REPO/.." && pwd)"          # …/ratiothink
-PIE="$OUTER/engine/pie"                   # engine extracted from the release DMG
+PIE="${PIE:-$OUTER/engine/pie}"
 PORT="${PORT:-8100}"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
@@ -69,7 +69,7 @@ cmd_build() {
 
 cmd_serve() {
   local which_model="${1:-real}"
-  local cfg="$REPO/Gateway/dev/pie.$which_model.toml"
+  local cfg="${PIE_CONFIG:-$REPO/Gateway/dev/pie.$which_model.toml}"
   [[ -f "$cfg" ]] || { echo "error: no config $cfg (use real|dummy)" >&2; exit 1; }
   [[ -x "$PIE" ]] || { echo "error: pie engine not found at $PIE" >&2; exit 1; }
   [[ -x "$REPO/Gateway/target/release/ratio-gateway" ]] || cmd_build

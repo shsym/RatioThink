@@ -22,12 +22,13 @@ into `messages`, the boundary it names stops being the one the next chat turn
 asks for — and step 4 stops reusing.
 """
 import json
+import os
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8100"
+BASE = "http://127.0.0.1:%s" % os.environ.get("PORT", "8100")
 REPO = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                       capture_output=True, text=True, check=True).stdout.strip()
 EMITTER = f"{REPO}/.build/debug/bon-commit-body"

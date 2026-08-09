@@ -16,11 +16,12 @@ from the SERVER's own route list and from the CLIENT's routing rule, and asserts
 the two agree — rather than restating either.
 """
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8100"
+BASE = "http://127.0.0.1:%s" % os.environ.get("PORT", "8100")
 FAILURES = []
 
 # The client's routing rule, transcribed from HTTPEngineClient.swift:187-200.
