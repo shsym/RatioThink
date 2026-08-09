@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use pie_client::client::Client;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -115,9 +115,9 @@ impl Engine {
 
 /// Install once at boot — `program::add` is global (handler.rs:409) and each
 /// session caches `installed_programs` (handler.rs:465-473).
-pub async fn install(client: &Client, wasm: &PathBuf, manifest: &PathBuf) -> Result<()> {
+pub async fn install(client: &Client, wasm: &Path, manifest: &Path) -> Result<()> {
     client
-        .add_program(wasm.as_path(), manifest.as_path(), true)
+        .add_program(wasm, manifest, true)
         .await
         .with_context(|| format!("add_program failed for {}", wasm.display()))
 }

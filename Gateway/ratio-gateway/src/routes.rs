@@ -46,6 +46,7 @@ impl AppState {
     /// Resolve a route name, or produce the 404 that names the alternatives —
     /// a bare "not found" here sends people hunting for a routing bug when the
     /// real problem is a missing file in the inferlet directory.
+    #[allow(clippy::result_large_err)]
     pub fn resolve(&self, route: &str) -> Result<Arc<Entry>, Response> {
         let reg = self.registry();
         match reg.get(route) {
@@ -261,12 +262,12 @@ async fn reload(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response
             .map(|(_, d)| d.as_str());
         if was != Some(e.digest.as_str()) {
             changed.push(json!({"route": e.route, "from": was, "to": e.digest}));
-            if e.preload {
-                if let Err(err) = st.ensure_installed(e).await {
-                    // The registry already points at the new version, so this
-                    // route will retry the install on its next request.
-                    tracing::warn!(route = %e.route, error = %err, "preload after reload failed");
-                }
+            if e.preload
+                && let Err(err) = st.ensure_installed(e).await
+            {
+                // The registry already points at the new version, so this
+                // route will retry the install on its next request.
+                tracing::warn!(route = %e.route, error = %err, "preload after reload failed");
             }
         }
     }

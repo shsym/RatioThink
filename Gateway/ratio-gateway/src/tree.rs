@@ -375,10 +375,10 @@ async fn drive(
                         // from one that reuses. The guest completes both
                         // boundary saves BEFORE its terminal event (§6.1), so
                         // waiting for the return costs nothing.
-                        if let Ok(Some(ev)) = decoded {
-                            if is_terminal(&ev) || matches!(ev, Event::Error { .. }) {
-                                terminal_seen = true;
-                            }
+                        if let Ok(Some(ev)) = decoded
+                            && (is_terminal(&ev) || matches!(ev, Event::Error { .. }))
+                        {
+                            terminal_seen = true;
                         }
                     }
                     // The guest returned. Its terminal event already went out;

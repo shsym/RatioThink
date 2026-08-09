@@ -68,12 +68,11 @@ struct PortFileGuard(Option<PathBuf>);
 
 impl Drop for PortFileGuard {
     fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            if let Err(error) = std::fs::remove_file(path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(path = %path.display(), %error, "failed to remove port file");
-            }
+        if let Some(path) = &self.0
+            && let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "failed to remove port file");
         }
     }
 }
