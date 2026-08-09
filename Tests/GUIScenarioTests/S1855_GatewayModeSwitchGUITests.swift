@@ -16,6 +16,13 @@ final class S1855_GatewayModeSwitchGUITests: XCTestCase {
     let baseURL = try XCTUnwrap(config["BASE_URL"])
     let pieHome = try XCTUnwrap(config["PIE_HOME"])
     let model = config["MODEL"] ?? "qwen"
+    let chatBackend = try XCTUnwrap(
+      config["RATIO_CHAT_BACKEND"],
+      "/tmp/pr333-gui.env must set RATIO_CHAT_BACKEND=gateway")
+    guard chatBackend == "gateway" else {
+      XCTFail("S1855 must run against the gateway backend, got \(chatBackend)")
+      return
+    }
 
     let app = XCUIApplication(bundleIdentifier: "com.ratiothink.app")
     app.launchArguments.append(contentsOf: [
@@ -27,6 +34,7 @@ final class S1855_GatewayModeSwitchGUITests: XCTestCase {
     app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = model
     app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
     app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
+    app.launchEnvironment["RATIO_CHAT_BACKEND"] = chatBackend
     configureCompletedFirstLaunch(app, suiteName: stablePreferenceSuiteName(pieHome))
     defer { app.terminate() }
 
