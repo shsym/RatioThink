@@ -413,13 +413,14 @@ async fn echo(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Respo
         Ok(p) => p,
         Err(e) => return api_error(StatusCode::BAD_GATEWAY, "launch_failed", &e.to_string()),
     };
+    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
 
     // Deferred commit (§8.1): hold the status open until the guest speaks, so a
     // fast failure is still a clean JSON error rather than a 200 that turns bad.
     let mut seq = SeqChecker::default();
     let first = match timeout(st.first_event_timeout, proc.recv()).await {
         Err(_) => {
-            let _ = client.terminate_process(proc.id()).await;
+            termination.terminate().await;
             return api_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "inferlet_start_timeout",
@@ -437,6 +438,7 @@ async fn echo(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Respo
             return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
         }
         Ok(Ok(ProcessEvent::Return(_))) => {
+            termination.disarm();
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "no_output",
@@ -459,7 +461,7 @@ async fn echo(State(st): State<Arc<AppState>>, body: axum::body::Bytes) -> Respo
     }
     tokio::spawn(drive(
         proc,
-        Arc::clone(&client),
+        termination,
         tx,
         cancel_rx,
         seq,
@@ -546,13 +548,12 @@ impl Drop for TerminateProcessOnDrop {
 /// must be owned here rather than reached from the drop guard.
 async fn drive(
     mut proc: Process,
-    client: Arc<Client>,
+    mut termination: TerminateProcessOnDrop,
     tx: mpsc::Sender<Frame>,
     mut cancel_rx: oneshot::Receiver<()>,
     mut seq: SeqChecker,
     grace: Duration,
 ) {
-    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
     loop {
         tokio::select! {
             _ = &mut cancel_rx => {

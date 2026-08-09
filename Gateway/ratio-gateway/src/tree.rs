@@ -17,7 +17,7 @@ use crate::routes::{AppState, CancelOnDrop, TerminateProcessOnDrop};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
-use pie_client::client::{Client, Process, ProcessEvent};
+use pie_client::client::{Process, ProcessEvent};
 use ratio_wire::RunInput;
 use ratio_wire::{Event, OpenAiSse, SeqChecker};
 use std::convert::Infallible;
@@ -138,9 +138,10 @@ pub async fn dispatch(
         Ok(p) => p,
         Err(e) => return api_error(StatusCode::BAD_GATEWAY, "launch_failed", &e.to_string()),
     };
+    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
 
     if control {
-        return unary_response(client, proc, seq_start(), st.first_event_timeout).await;
+        return unary_response(proc, termination, seq_start(), st.first_event_timeout).await;
     }
 
     // ---- deferred commit ----
@@ -158,7 +159,7 @@ pub async fn dispatch(
     let opening: Event = loop {
         match timeout(st.first_event_timeout, proc.recv()).await {
             Err(_) => {
-                let _ = client.terminate_process(proc.id()).await;
+                termination.terminate().await;
                 return api_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     "inferlet_start_timeout",
@@ -176,6 +177,7 @@ pub async fn dispatch(
                 return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
             }
             Ok(Ok(ProcessEvent::Return(_))) => {
+                termination.disarm();
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "no_output",
@@ -203,7 +205,7 @@ pub async fn dispatch(
                         message,
                         param,
                     })) => {
-                        let _ = client.terminate_process(proc.id()).await;
+                        termination.terminate().await;
                         return api_error_param(
                             status_for(&code),
                             &code,
@@ -217,7 +219,7 @@ pub async fn dispatch(
                     // known events are protocol failures.
                     Ok(None) => continue,
                     Err(pe) => {
-                        let _ = client.terminate_process(proc.id()).await;
+                        termination.terminate().await;
                         return api_error(
                             StatusCode::BAD_GATEWAY,
                             "protocol_error",
@@ -235,7 +237,7 @@ pub async fn dispatch(
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     tokio::spawn(drive(
         proc,
-        Arc::clone(&client),
+        termination,
         tx,
         cancel_rx,
         seq,
@@ -314,7 +316,7 @@ fn api_error_param(status: StatusCode, code: &str, message: &str, param: Option<
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     mut proc: Process,
-    client: Arc<Client>,
+    mut termination: TerminateProcessOnDrop,
     tx: mpsc::Sender<Frame>,
     mut cancel_rx: oneshot::Receiver<()>,
     mut seq: SeqChecker,
@@ -322,7 +324,6 @@ async fn drive(
     route: String,
 ) {
     let pid = proc.id().to_string();
-    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
     let mut terminal_seen = false;
     loop {
         tokio::select! {
@@ -544,12 +545,11 @@ fn seq_start() -> SeqChecker {
 /// JSON body, so a guest error is a real HTTP status all the way through rather
 /// than an in-band frame after a 200.
 async fn unary_response(
-    client: Arc<Client>,
     mut proc: Process,
+    mut termination: TerminateProcessOnDrop,
     mut seq: SeqChecker,
     first_event_timeout: Duration,
 ) -> Response {
-    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
     loop {
         match timeout(first_event_timeout, proc.recv()).await {
             Err(_) => {

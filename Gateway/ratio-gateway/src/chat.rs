@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
-use pie_client::client::{Client, Process, ProcessEvent};
+use pie_client::client::{Process, ProcessEvent};
 use ratio_wire::{Event, GenResult, OpenAiSse, RunInput, SeqChecker};
 use serde_json::json;
 use std::convert::Infallible;
@@ -172,6 +172,7 @@ pub async fn chat_completions(
         Ok(p) => p,
         Err(e) => return api_error(StatusCode::BAD_GATEWAY, "launch_failed", &e.to_string()),
     };
+    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
 
     // Deferred commit: hold the status open until the guest reaches `Ready`.
     // Warnings may precede it and are buffered (doc §5.3 rule 1).
@@ -181,7 +182,7 @@ pub async fn chat_completions(
     loop {
         match timeout(st.first_event_timeout, proc.recv()).await {
             Err(_) => {
-                let _ = client.terminate_process(proc.id()).await;
+                termination.terminate().await;
                 return api_error(
                     StatusCode::GATEWAY_TIMEOUT,
                     "inferlet_start_timeout",
@@ -199,6 +200,7 @@ pub async fn chat_completions(
                 return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
             }
             Ok(Ok(ProcessEvent::Return(_))) => {
+                termination.disarm();
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "no_output",
@@ -223,12 +225,12 @@ pub async fn chat_completions(
                     }
                     // A pre-commit failure is still a real HTTP status.
                     Ok(Some(Event::Error { code, message, .. })) => {
-                        let _ = client.terminate_process(proc.id()).await;
+                        termination.terminate().await;
                         return api_error(status_for(&code), &code, &message);
                     }
                     Ok(Some(_)) | Ok(None) => {}
                     Err(pe) => {
-                        let _ = client.terminate_process(proc.id()).await;
+                        termination.terminate().await;
                         return api_error(
                             StatusCode::BAD_GATEWAY,
                             "protocol_error",
@@ -244,8 +246,8 @@ pub async fn chat_completions(
     if stream {
         stream_response(
             st,
-            client,
             proc,
+            termination,
             seq,
             pre_warnings,
             request_id,
@@ -255,15 +257,15 @@ pub async fn chat_completions(
             started,
         )
     } else {
-        buffered_response(client, proc, seq, request_id, model, created, started).await
+        buffered_response(proc, termination, seq, request_id, model, created, started).await
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
     st: Arc<AppState>,
-    client: Arc<Client>,
     proc: Process,
+    termination: TerminateProcessOnDrop,
     seq: SeqChecker,
     pre_warnings: Vec<Event>,
     id: String,
@@ -276,7 +278,7 @@ fn stream_response(
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
     tokio::spawn(drive(
         proc,
-        Arc::clone(&client),
+        termination,
         tx,
         cancel_rx,
         seq,
@@ -333,15 +335,14 @@ fn stream_response(
 /// Non-streaming shares the same guest loop; it just discards the deltas and
 /// serializes the terminal `GenResult` (doc §4.2).
 async fn buffered_response(
-    client: Arc<Client>,
     mut proc: Process,
+    mut termination: TerminateProcessOnDrop,
     mut seq: SeqChecker,
     id: String,
     model: String,
     created: i64,
     started: Instant,
 ) -> Response {
-    let mut termination = TerminateProcessOnDrop::new(Arc::clone(&client), &proc);
     let mut result: Option<GenResult> = None;
     let mut err: Option<(String, String)> = None;
     loop {
@@ -454,7 +455,7 @@ async fn buffered_response(
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     mut proc: Process,
-    client: Arc<Client>,
+    mut termination: TerminateProcessOnDrop,
     tx: mpsc::Sender<Frame>,
     mut cancel_rx: oneshot::Receiver<()>,
     mut seq: SeqChecker,
@@ -569,7 +570,7 @@ async fn drive(
     }
 
     // ALWAYS terminate: every exit path, including a lost receiver.
-    let _ = client.terminate_process(&pid).await;
+    termination.terminate().await;
 
     // A fault after commit must still produce a terminal chunk. Without this a
     // generic OpenAI client sees a clean `[DONE]` after a truncated answer.
