@@ -126,15 +126,9 @@ public protocol PieHelperXPC {
 
   /// Backend-aware start (`ratio-gateway` vs the chat-apc daemon).
   ///
-  /// `@objc optional` on purpose: this is additive to a protocol with ~10
-  /// implementors across the app, helper and test suites, and a required
-  /// member would break every one of them for a migration-only flag. Callers
-  /// fall back to `startEngine(profileID:modelOverride:)`, which is exactly
-  /// the `.daemon` behavior.
-  ///
   /// `chatBackend` is `ChatBackend.rawValue` — only `String` traverses the
   /// connection natively, so it crosses as one.
-  @objc optional func startEngineWithBackend(
+  func startEngineWithBackend(
     profileID: String,
     modelOverride: String?,
     chatBackend: String,

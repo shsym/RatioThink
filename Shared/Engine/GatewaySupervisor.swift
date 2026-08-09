@@ -1,22 +1,6 @@
 import Foundation
 
-/// Spawns and supervises `ratio-gateway` as a sibling process of the engine.
-///
-/// Design decision (2026-08-01): the gateway is a **supervised sibling
-/// process**, not a library linked into the helper. So something must own its
-/// lifecycle and publish its port, and that is this type.
-///
-/// Why the port matters more than it looks: the app does NOT read
-/// `<PIE_HOME>/http.port`. `HTTPEngineClient` resolves its base URL from
-/// `EngineStatus.running(port:)` (`EngineStatusStore.baseURL`), which
-/// `PieEngineHost` publishes from whatever `PieControlLauncher.launch`
-/// returns. Redirecting the app to the gateway therefore means returning the
-/// GATEWAY's port from the launcher — rewriting the port file only moves test
-/// harnesses.
-///
-/// The gateway runs in **attach** mode: `pie serve` is already up and owned by
-/// `PieControlLauncher`, so the gateway is handed the existing control address
-/// and token rather than spawning an engine of its own.
+/// Owns the gateway process attached to a helper-owned PIE engine.
 public actor GatewaySupervisor {
 
   public enum SupervisorError: Error, CustomStringConvertible {
@@ -63,10 +47,13 @@ public actor GatewaySupervisor {
   }
 
   private var process: Process?
-  /// Remembered so health can be re-probed after startup. Readiness alone is
-  /// not supervision: a gateway that dies later leaves the app pinned to a
-  /// dead port while pie itself stays perfectly healthy.
+  private var standardInput: Pipe?
   private var boundPort: UInt16?
+  private var publishedPort: UInt16?
+  private var spec: Spec?
+  private var portFile: URL?
+  private var shutdownInProgress = false
+  private var shutdownResult: EngineShutdownResult?
   private var tail: [String] = []
   private let tailLimit = 40
 
@@ -84,38 +71,53 @@ public actor GatewaySupervisor {
 
     let portFile = FileManager.default.temporaryDirectory
       .appendingPathComponent("ratio-gateway-\(ProcessInfo.processInfo.processIdentifier).port")
-    try? FileManager.default.removeItem(at: portFile)
+    self.spec = spec
+    self.portFile = portFile
+    let port = try await startProcess(spec: spec, port: 0, portFile: portFile)
+    publishedPort = port
+    return port
+  }
+
+  private func startProcess(spec: Spec, port: UInt16, portFile: URL) async throws -> UInt16 {
+    try removePortFile(portFile)
 
     let proc = Process()
     proc.executableURL = spec.binary
     proc.arguments = [
-      "--listen", "127.0.0.1:0",           // ephemeral; we read the real port back
+      "--listen", "127.0.0.1:\(port)",
       "--pie-url", spec.pieURL,
       "--pie-token", spec.pieToken,
-      // The gateway scans this directory for `{name}.wasm` + `{name}.Pie.toml`
-      // pairs, so shipping a new inferlet is a bundle change, not a code change.
-      // No `--admin-token`: the bundle is read-only and reload would have
-      // nothing new to find, so /v1/admin/reload stays disabled here.
       "--inferlet-dir", spec.inferlets.path,
       "--port-file", portFile.path,
+      "--exit-on-stdin-eof",
     ]
-    let pipe = Pipe()
-    proc.standardOutput = pipe
-    proc.standardError = pipe
+    let output = Pipe()
+    let input = Pipe()
+    proc.standardOutput = output
+    proc.standardError = output
+    proc.standardInput = input
 
-    let handle = pipe.fileHandleForReading
+    let handle = output.fileHandleForReading
     handle.readabilityHandler = { [weak self] h in
       let data = h.availableData
       guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
       Task { await self?.appendTail(text) }
     }
 
-    try proc.run()
+    do {
+      try proc.run()
+    } catch {
+      handle.readabilityHandler = nil
+      try? removePortFile(portFile)
+      throw error
+    }
     self.process = proc
+    self.standardInput = input
 
     let deadline = Date().addingTimeInterval(spec.readinessTimeout)
     while Date() < deadline {
       if !proc.isRunning {
+        _ = await stopCurrentProcess()
         throw SupervisorError.exitedEarly(code: proc.terminationStatus, tail: await currentTail())
       }
       if let port = readPort(portFile), await probeHealthz(port: port) {
@@ -124,7 +126,7 @@ public actor GatewaySupervisor {
       }
       try? await Task.sleep(nanoseconds: 100_000_000)
     }
-    await shutdown(reason: "readiness_timeout")
+    _ = await stopCurrentProcess()
     throw SupervisorError.readinessTimeout(
       elapsed: spec.readinessTimeout, tail: await currentTail())
   }
@@ -134,13 +136,34 @@ public actor GatewaySupervisor {
   /// Two signals, cheapest first: the child process, then an actual `/healthz`
   /// round trip — a wedged gateway can still be "running".
   public func health() async -> String? {
-    guard let proc = process else { return nil }   // never started / already torn down
+    guard let proc = process else {
+      return spec == nil || shutdownResult != nil ? nil : "gateway process unavailable"
+    }
     if !proc.isRunning {
       return "gateway process exited (code \(proc.terminationStatus))"
     }
     guard let port = boundPort else { return nil } // pre-readiness; defer
     if await probeHealthz(port: port) { return nil }
     return "gateway /healthz unreachable on port \(port)"
+  }
+
+  /// Restarts only the gateway on its published port when PIE is still alive.
+  public func recoverIfNeeded() async -> String? {
+    guard let failure = await health() else { return nil }
+    guard !shutdownInProgress, shutdownResult == nil,
+          let spec, let port = publishedPort, let portFile
+    else { return failure }
+
+    let stopped = await stopCurrentProcess()
+    guard stopped.reaped else {
+      return "\(failure); gateway could not be reaped: \(stopped.message)"
+    }
+    do {
+      _ = try await startProcess(spec: spec, port: port, portFile: portFile)
+      return nil
+    } catch {
+      return "\(failure); gateway recovery failed: \(error)"
+    }
   }
 
   private func readPort(_ file: URL) -> UInt16? {
@@ -167,19 +190,58 @@ public actor GatewaySupervisor {
 
   private func currentTail() async -> [String] { tail }
 
-  /// Idempotent. SIGTERM, then SIGKILL if it does not exit — mirroring the
-  /// engine's own teardown discipline.
-  public func shutdown(reason: String) async {
-    guard let proc = process else { return }
+  public func shutdown(reason: String) async -> EngineShutdownResult {
+    if let shutdownResult { return shutdownResult }
+    if shutdownInProgress {
+      while shutdownResult == nil {
+        try? await Task.sleep(nanoseconds: 10_000_000)
+      }
+      return shutdownResult ?? .unreaped("gateway shutdown did not complete")
+    }
+    shutdownInProgress = true
+    let result = await stopCurrentProcess()
+    shutdownResult = result
+    NSLog("GatewaySupervisor: shut down (\(reason))")
+    return result
+  }
+
+  private func stopCurrentProcess() async -> EngineShutdownResult {
+    guard let proc = process else {
+      if let portFile { try? removePortFile(portFile) }
+      return .reaped
+    }
+    let input = standardInput
     process = nil
+    standardInput = nil
     boundPort = nil
-    guard proc.isRunning else { return }
-    proc.terminate()
-    for _ in 0..<50 where proc.isRunning {
+    try? input?.fileHandleForWriting.close()
+    for _ in 0..<20 where proc.isRunning {
       try? await Task.sleep(nanoseconds: 100_000_000)
     }
-    if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
-    NSLog("GatewaySupervisor: shut down (\(reason))")
+    if proc.isRunning {
+      proc.terminate()
+      for _ in 0..<50 where proc.isRunning {
+        try? await Task.sleep(nanoseconds: 100_000_000)
+      }
+    }
+    if proc.isRunning {
+      kill(proc.processIdentifier, SIGKILL)
+      for _ in 0..<50 where proc.isRunning {
+        try? await Task.sleep(nanoseconds: 100_000_000)
+      }
+    }
+    if let portFile { try? removePortFile(portFile) }
+    return proc.isRunning
+      ? .unreaped("SIGKILL did not reap gateway pid \(proc.processIdentifier)")
+      : .reaped
+  }
+
+  private func removePortFile(_ file: URL) throws {
+    do {
+      try FileManager.default.removeItem(at: file)
+    } catch CocoaError.fileNoSuchFile {
+      return
+    }
   }
 }
 

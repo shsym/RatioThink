@@ -156,7 +156,7 @@ public enum HelperProtocolCompatibility {
   /// or an in-place upgrade leaves a running old helper that passes the
   /// reachability gate yet cannot service the new call (incl. a reply/status
   /// BYTE-format change like #476).
-  public static let currentVersion = 7
+  public static let currentVersion = 8
 
   public static func isCompatible(client: any AppXPCClient) async -> Bool {
     do {
@@ -664,17 +664,12 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
       // `launchEnvironment`. Resolving it app-side is the whole point of
       // carrying it over XPC.
       //
-      // Only taken when explicitly opting in: with the flag unset this is
-      // `.daemon` and the original call runs unchanged, so the default path
-      // exercises no new XPC surface.
       let backend = ChatBackend.fromEnvironment()
-      if backend != .daemon, let startWithBackend = api.startEngineWithBackend {
-        startWithBackend(profileID, modelOverride, backend.rawValue) { successData, errorData in
-          Self.handleStartReply(successData, errorData, resumeOnce)
-        }
-        return
-      }
-      api.startEngine(profileID: profileID, modelOverride: modelOverride) { successData, errorData in
+      api.startEngineWithBackend(
+        profileID: profileID,
+        modelOverride: modelOverride,
+        chatBackend: backend.rawValue
+      ) { successData, errorData in
         // Contract (PieHelperXPC): exactly one of (successData=EnginePort,
         // errorData=EngineError) is non-nil. We discard the port — the
         // caller relies on the engine-status poll for the live `.running`

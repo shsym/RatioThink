@@ -847,15 +847,7 @@ public enum PieControlLauncher {
     // reconnects on demand.
     await session.recordControlWSURL(wsURL)
     let client = PieControlClient(url: wsURL)
-    // §2 sequencing fix. `launch_daemon` is pie's `wasi:http` hosting — the
-    // exact mechanism pie is REMOVING. Calling it unconditionally meant
-    // gateway mode still depended on it, so the "post-HTTP" path could never
-    // actually run post-HTTP. In gateway mode we skip it entirely: the gateway
-    // is then the only HTTP surface, driving pie over the WebSocket control
-    // plane alone.
-    // Spec first; the environment is only a fallback for CLI harnesses that
-    // build a spec directly and have no XPC caller.
-    let backend = spec.chatBackend == .gateway ? .gateway : ChatBackend.fromEnvironment()
+    let backend = spec.chatBackend
     let httpPort: UInt16
     do {
       try await client.connect()
@@ -948,12 +940,23 @@ public enum PieControlLauncher {
             pieURL: "ws://\(handshake.address)",
             pieToken: handshake.token))
         await session.adoptGateway(supervisor)
-        try? writePortFile(port: gatewayPort, in: spec.pieHome)
+        do {
+          try writePortFile(port: gatewayPort, in: spec.pieHome)
+        } catch {
+          let shutdownResult = await session.shutdown(reason: "launch.port_file_failed")
+          if !shutdownResult.reaped {
+            throw LaunchError.shutdownFailed(
+              underlying: "\(error)", shutdownFailure: shutdownResult.message)
+          }
+          throw error
+        }
         return (gatewayPort, session)
       } catch {
-        // Fail loud rather than silently serving the daemon: an operator who
-        // asked for the gateway and got chat-apc would A/B the wrong thing.
-        _ = await session.shutdown(reason: "launch.gateway_failed")
+        let shutdownResult = await session.shutdown(reason: "launch.gateway_failed")
+        if !shutdownResult.reaped {
+          throw LaunchError.shutdownFailed(
+            underlying: "\(error)", shutdownFailure: shutdownResult.message)
+        }
         throw error
       }
     }
@@ -1334,6 +1337,7 @@ public actor LaunchedSession {
   private var outputTailerStarted = false
   private var maxResidentMemoryBytes: UInt64?
   private var shutdownDone = false
+  private var shutdownTask: Task<EngineShutdownResult, Never>?
   /// Control-plane WS address, retained post-handshake so liveness
   /// probes can reconnect ( G1). `nil` until `launch()` records it.
   private var controlWSURL: URL?
@@ -1494,7 +1498,7 @@ public actor LaunchedSession {
     // nothing probed it after startup. Checked BEFORE the engine ping: if the
     // gateway is gone the app cannot reach anything, so the engine's health is
     // moot and the restart ladder should fire on the real cause.
-    if let gateway, let reason = await gateway.health() {
+    if let gateway, let reason = await gateway.recoverIfNeeded() {
       return .gone(reason: reason)
     }
     guard let controlWSURL else {
@@ -1562,18 +1566,23 @@ public actor LaunchedSession {
   }
 
   public func shutdown(reason: String) async -> EngineShutdownResult {
-    if let gateway {
-      await gateway.shutdown(reason: reason)
-      self.gateway = nil
-    }
-    guard !shutdownDone else {
-      return process.isRunning
-        ? .unreaped("shutdown was already requested but pid \(process.processIdentifier) is still running")
-        : .reaped
-    }
-    shutdownDone = true
+    if let shutdownTask { return await shutdownTask.value }
+    let task = Task { await self.performShutdown(reason: reason) }
+    shutdownTask = task
+    return await task.value
+  }
 
+  private func performShutdown(reason: String) async -> EngineShutdownResult {
+    shutdownDone = true
     var failures: [String] = []
+    if let gateway {
+      let gatewayResult = await gateway.shutdown(reason: reason)
+      self.gateway = nil
+      if !gatewayResult.reaped {
+        failures.append(gatewayResult.message)
+      }
+    }
+
     let pid = process.processIdentifier
     let wasRunning = process.isRunning
     DiagnosticLog.helper.event("engine.shutdown", [
@@ -1659,7 +1668,7 @@ public actor LaunchedSession {
     // reaped cleanly — drop ownership so neither the exit handler nor the
     // next-launch backstop targets an already-dead (or recycled) pid.
     EngineReaper.release()
-    return .reaped
+    return failures.isEmpty ? .reaped : .unreaped(failures.joined(separator: "; "))
   }
 
   /// Reads stdout until both handshake markers appear or the

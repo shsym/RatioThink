@@ -346,18 +346,23 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
                                      modelOverride: String?,
                                      chatBackend: String,
                                      reply: @escaping (Data?, Data?) -> Void) {
-    requestedChatBackend = ChatBackend(rawValue: chatBackend.lowercased()) ?? .daemon
-    startEngine(profileID: profileID, modelOverride: modelOverride, reply: reply)
+    startEngine(
+      profileID: profileID,
+      modelOverride: modelOverride,
+      backend: ChatBackend(rawValue: chatBackend.lowercased()) ?? .daemon,
+      reply: reply)
   }
-
-  /// Backend for the next launch. Set by the XPC call above; defaults to the
-  /// environment so CLI harnesses and the existing (non-backend) start method
-  /// keep working unchanged.
-  var requestedChatBackend: ChatBackend = ChatBackend.fromEnvironment()
 
   public func startEngine(profileID: String,
                           modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
+    startEngine(profileID: profileID, modelOverride: modelOverride, backend: .daemon, reply: reply)
+  }
+
+  private func startEngine(profileID: String,
+                           modelOverride: String?,
+                           backend: ChatBackend,
+                           reply: @escaping (Data?, Data?) -> Void) {
     guard let engineHost else {
       Self.log.error("startEngine: no engineHost wired (early boot or unit test)")
       reply(nil, Self.notImplementedErrorData)
@@ -366,13 +371,14 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     // No explicit bind host on this path: the resolver injects the
     // file-backed persisted Local API bind mode into the spec, so a
     // model-pick start still inherits the user's exposure preference.
-    guard let spec = resolveLaunchSpec(profileID: profileID,
+    guard var spec = resolveLaunchSpec(profileID: profileID,
                                        explicitModel: modelOverride,
                                        engineHost: engineHost,
                                        operation: "startEngine",
                                        reply: reply) else {
       return
     }
+    spec.chatBackend = backend
     let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
     func fireOnce(_ result: Result<EngineSessionSnapshot, EngineError>) {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
@@ -546,12 +552,6 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
     }
     switch launchSpecResolver(profileID, explicitModel) {
     case .success(let spec):
-      // Close the chain: the resolver closure's shape is
-      // `(profileID, explicitModel)` and is an existing test seam, so the
-      // backend is stamped onto the returned spec here rather than threaded
-      // through it. Without this the XPC value was recorded and then dropped.
-      var spec = spec
-      spec.chatBackend = requestedChatBackend
       return spec
     case .failure(let err):
       // #477 F1: the resolver/guardrail prose (sizing, path-by-path trace)
@@ -999,6 +999,13 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
                           modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
+    reply(nil, degradedErrorData)
+  }
+
+  public func startEngineWithBackend(profileID: String,
+                                     modelOverride: String?,
+                                     chatBackend: String,
+                                     reply: @escaping (Data?, Data?) -> Void) {
     reply(nil, degradedErrorData)
   }
 
