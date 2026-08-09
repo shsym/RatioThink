@@ -697,6 +697,7 @@ public final class ChatSendController: ObservableObject {
       stream: true,
       speculation: wireSpec,
       cache: cache,
+      boundary: cache,
       responseFormat: wireResponseFormat
     )
   }
@@ -736,6 +737,19 @@ public final class ChatSendController: ObservableObject {
     """
   }
 
+  /// The conversation-identity directive every generative request carries.
+  ///
+  /// One helper so chat, tree-of-thought and Best-of-N agree by construction:
+  /// the boundary is content-addressed, so two modes share KV only if they
+  /// present the SAME key and compat for the same conversation.
+  private static func boundaryDirective(chat: Chat, turnCount: Int,
+                                        options: ChatSendRequestOptions) -> ChatCacheDirective {
+    ChatCacheDirective(
+      key: chat.id.uuidString,
+      turn: turnCount,
+      retention: retentionDirective(from: options.kvUsageSnapshot, modelID: options.modelID))
+  }
+
   private static func retentionDirective(from snapshot: KVUsageSnapshot?,
                                          modelID: String) -> ChatCacheRetentionDirective? {
     guard let snapshot,
@@ -759,6 +773,9 @@ public final class ChatSendController: ObservableObject {
   ) -> InferletRequest? {
     let input = ToTRequestInput(
       model: options.modelID,
+      boundary: Self.boundaryDirective(
+        chat: chat, turnCount: transcriptTurns(chat: chat, options: options).count,
+        options: options),
       messages: transcriptTurns(chat: chat, options: options),
       breadth: config.breadth,
       depth: config.depth,
@@ -775,6 +792,14 @@ public final class ChatSendController: ObservableObject {
   /// candidate's snapshot + text, the unpicked siblings to drop, and the new
   /// level the round generates at.
   public struct BestOfNResume: Equatable, Sendable {
+    /// The scope of the round being RESUMED.
+    ///
+    /// A think-more continues the same Best-of-N session, so it must carry the
+    /// prior round's scope forward — the guest authorizes `resume_from` and the
+    /// `unpicked` deletes against it, and a freshly minted scope makes every
+    /// one of those names belong to "a different round". Minting a new UUID per
+    /// call made think-more fail with a hard 400 on every attempt.
+    public let roundID: String
     public let pickedName: String
     public let pickedText: String
     /// Optional per-round user guidance for the next level (#715). Nil preserves
@@ -783,12 +808,14 @@ public final class ChatSendController: ObservableObject {
     public let unpicked: [String]
     public let level: Int
     public init(
+      roundID: String,
       pickedName: String,
       pickedText: String,
       selectedComment: String? = nil,
       unpicked: [String],
       level: Int
     ) {
+      self.roundID = roundID
       self.pickedName = pickedName
       self.pickedText = pickedText
       let trimmed = selectedComment?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -816,8 +843,20 @@ public final class ChatSendController: ObservableObject {
     cancel()
     generation &+= 1
     let myGeneration = generation
+    // The round's authorization scope, established BEFORE the request so it
+    // exists even if the round never reaches its terminal — a round with no
+    // scope can never be released, and the guest refuses to mint snapshots
+    // without one. Client-owned rather than read back from `tree_start.id`:
+    // the guest needs it at snapshot-naming time, which is before the app has
+    // seen any frame.
+    //
+    // A think-more CONTINUES its round rather than starting one, so it carries
+    // the prior scope. Minting fresh here made the guest reject every
+    // `resume_from` as belonging to a different round — a hard 400 on every
+    // think-more. `level` is what distinguishes the steps within a session.
+    let roundID = resume?.roundID ?? UUID().uuidString
     guard let request = Self.makeBestOfNRequest(
-      chat: chat, config: config, options: options, resume: resume)
+      chat: chat, config: config, options: options, resume: resume, roundID: roundID)
     else {
       persistenceStatus.report(
         ToTSendError.requestEncodingFailed, context: "ChatSendController.makeBestOfNRequest")
@@ -875,7 +914,8 @@ public final class ChatSendController: ObservableObject {
         level: 0, candidates: [], chosenID: nil,
         // #736 Bug C: carry the prior round's think-more guidance into this
         // round's DURABLE state so it survives the transition and redisplays.
-        inboundComment: resume?.selectedComment))
+        inboundComment: resume?.selectedComment,
+        roundID: roundID))
       do {
         for try await event in toTEventStream(from: engine.dispatchInferlet(request)) {
           guard self.generation == myGeneration, !Task.isCancelled else { return }
@@ -892,7 +932,8 @@ public final class ChatSendController: ObservableObject {
             assistant.tot = try? encoder.encode(tree)
             // The round's pick set — no choice yet; the user selects in the UI.
             let round = BestOfNRound(level: level, candidates: candidates, chosenID: nil,
-                                     inboundComment: resume?.selectedComment)
+                                     inboundComment: resume?.selectedComment,
+                                     roundID: roundID)
             assistant.bestOfN = try? encoder.encode(round)
             Self.persistTree(context, status: persistenceStatus)
             self.activeAssistant = nil
@@ -942,10 +983,15 @@ public final class ChatSendController: ObservableObject {
     chat: Chat,
     config: BestOfNProfileConfig,
     options: ChatSendRequestOptions,
-    resume: BestOfNResume?
+    resume: BestOfNResume?,
+    roundID: String
   ) -> InferletRequest? {
     let input = BestOfNRequestInput(
       model: options.modelID,
+      boundary: Self.boundaryDirective(
+        chat: chat, turnCount: transcriptTurns(chat: chat, options: options).count,
+        options: options),
+      roundID: roundID,
       messages: transcriptTurns(chat: chat, options: options),
       n: config.n,
       maxTokensPerCandidate: config.maxTokensPerCandidate,
@@ -973,13 +1019,22 @@ public final class ChatSendController: ObservableObject {
   /// `modelID` is the engine's served model; pass `nil` (e.g. from the chat-list
   /// delete path, which has no gate) to let the engine resolve its first
   /// registered model — it serves exactly one, so that is the same model.
+  ///
+  /// `roundID` is the round's authorization scope. A round persisted before it
+  /// existed has none, and the guest will refuse every name — correctly, since
+  /// the only available fallback would authorize every round of every chat.
+  /// Callers pass nil for those and the release is skipped rather than issued
+  /// and refused.
   public func releaseBestOfNSnapshots(
     engine: EngineClient,
     modelID: String?,
+    roundID: String?,
     snapshotNames: [String]
   ) {
     guard !snapshotNames.isEmpty,
-          let request = Self.makeBestOfNReleaseRequest(modelID: modelID, names: snapshotNames)
+          let roundID, !roundID.isEmpty,
+          let request = Self.makeBestOfNReleaseRequest(
+            modelID: modelID, roundID: roundID, names: snapshotNames)
     else { return }
     Task { @MainActor in
       do {
@@ -1008,12 +1063,156 @@ public final class ChatSendController: ObservableObject {
     }
   }
 
+  // MARK: Commit (§6.2)
+
+  /// A prepared Best-of-N commit, captured BEFORE the answer is written
+  /// locally.
+  ///
+  /// The two-phase shape is forced by two invariants that pull in opposite
+  /// directions:
+  ///
+  /// * The commit's `messages` must be the canonical history WITHOUT the
+  ///   accepted answer — the guest appends `assistant(answer)` itself, and a
+  ///   history that already contains it would name a boundary with the answer
+  ///   twice, which nothing ever asks for. An assistant row with empty content
+  ///   is excluded from history (`excludesFromRequestHistory`), so the request
+  ///   must be built while `message.content` is still empty.
+  /// * Nothing may be deleted unless the local save succeeded — the existing
+  ///   rule that keeps a rejected commit from discarding its recovery state.
+  ///
+  /// So: prepare (pre-commit), save, then dispatch.
+  public struct PreparedBestOfNCommit: Sendable {
+    fileprivate let request: InferletRequest
+    fileprivate let fallbackRelease: InferletRequest?
+
+    /// The dispatch envelope this commit would send.
+    ///
+    /// Exposed so a gate can POST Swift's OWN bytes rather than a hand-written
+    /// approximation of them — see `Sources/bon-commit-body`. The bug this
+    /// guards against is a body that LOOKS right and names a boundary nothing
+    /// asks for, which no type-level agreement can catch: only encoding it and
+    /// putting it on the wire does.
+    public var dispatchRequest: InferletRequest { request }
+  }
+
+  /// Build the commit for `round`'s accepted `answer`. Call BEFORE committing
+  /// the answer into the message.
+  ///
+  /// Returns nil when the round carries no `roundID` — a round persisted before
+  /// the scope existed cannot authorize its own deletes, and the guest would
+  /// refuse every name. Those callers fall back to the old behaviour (commit
+  /// the text locally, free nothing) rather than issuing a request that would
+  /// be refused wholesale.
+  public static func prepareBestOfNCommit(
+    chat: Chat,
+    options: ChatSendRequestOptions,
+    round: BestOfNRound,
+    answer: String
+  ) -> PreparedBestOfNCommit? {
+    guard let roundID = round.roundID, !roundID.isEmpty,
+          let chosen = round.chosen
+    else { return nil }
+    let messages = transcriptTurns(chat: chat, options: options)
+    let input = BestOfNCommitInput(
+      model: options.modelID,
+      boundary: Self.boundaryDirective(chat: chat, turnCount: messages.count, options: options),
+      roundID: roundID,
+      messages: messages,
+      commit: BestOfNCommitInput.Commit(
+        snapshotName: chosen.snapshotName,
+        answer: answer,
+        release: round.candidates.map(\.snapshotName)))
+    guard let data = try? JSONEncoder().encode(input) else { return nil }
+    return PreparedBestOfNCommit(
+      request: InferletRequest(
+        inferlet: "best-of-n", input: data, messages: nil, stream: false),
+      // If the commit fails, the KV must still be freed: once the answer is
+      // committed the round drops out of the abandon sweep
+      // (`uncommittedRounds` skips messages with content), so nothing else
+      // would ever free it. The boundary is lost — costing the next turn a
+      // re-prefill — but the pages come back.
+      fallbackRelease: makeBestOfNReleaseRequest(
+        modelID: options.modelID, roundID: roundID,
+        names: round.candidates.map(\.snapshotName)))
+  }
+
+  /// Dispatch a prepared commit. Call only AFTER the answer is durably saved.
+  ///
+  /// Fire-and-forget like the release it replaces: the answer is already
+  /// persisted and visible, so the user must not wait on KV bookkeeping.
+  public func dispatchBestOfNCommit(_ prepared: PreparedBestOfNCommit, engine: EngineClient) {
+    Task { @MainActor in
+      do {
+        var frames: [Data] = []
+        for try await frame in engine.dispatchInferlet(prepared.request) { frames.append(frame) }
+        let ack = try Self.decodeCommitAck(frames: frames)
+        guard let ack else {
+          Log.engine.error("ChatSendController: best-of-n commit returned no ack")
+          Self.dispatchFallbackRelease(prepared, engine: engine)
+          return
+        }
+        if !ack.boundarySaved {
+          // The guest refused to delete anything, by design — so the round's
+          // KV is still live and still ours to free.
+          Log.engine.error(
+            "ChatSendController: best-of-n commit did not save the boundary; releasing instead")
+          Self.dispatchFallbackRelease(prepared, engine: engine)
+          return
+        }
+        if let message = Self.shortCommitLog(ack) {
+          Log.engine.notice("ChatSendController: \(message, privacy: .public)")
+        }
+      } catch {
+        let detail = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+        Log.engine.error(
+          "ChatSendController: best-of-n commit failed: \(detail, privacy: .public)")
+        Self.dispatchFallbackRelease(prepared, engine: engine)
+      }
+    }
+  }
+
+  private static func dispatchFallbackRelease(
+    _ prepared: PreparedBestOfNCommit, engine: EngineClient
+  ) {
+    guard let request = prepared.fallbackRelease else { return }
+    Task { @MainActor in
+      do {
+        for try await _ in engine.dispatchInferlet(request) {}
+      } catch {
+        Log.engine.error("ChatSendController: best-of-n fallback release failed")
+      }
+    }
+  }
+
+  /// Decode the unary commit ack. Same contract as `decodeReleaseAck`: a 2xx
+  /// body that is not a decodable ack THROWS rather than reading as success —
+  /// here that matters more, because "success" would mean the round's KV was
+  /// freed.
+  nonisolated static func decodeCommitAck(frames: [Data]) throws -> BestOfNCommitAck? {
+    var ack: BestOfNCommitAck?
+    for frame in frames {
+      ack = try JSONDecoder().decode(BestOfNCommitAck.self, from: frame)
+    }
+    return ack
+  }
+
+  /// One line, only when it says something. A refusal is always worth logging:
+  /// it means the client asked to free something it could not prove it owned.
+  nonisolated static func shortCommitLog(_ ack: BestOfNCommitAck) -> String? {
+    guard ack.refused > 0 || ack.released < ack.requested else { return nil }
+    return "best-of-n commit saved the boundary and freed \(ack.released)/\(ack.requested) "
+      + "snapshots (\(ack.absent) already absent, \(ack.refused) refused)"
+  }
+
   /// Build the chat-completions dispatch envelope for a Best-of-N
   /// snapshot-release request (#690): a `release` list, no messages, no
   /// generation. `modelID` is omitted when nil so the engine resolves its
   /// served model.
-  private static func makeBestOfNReleaseRequest(modelID: String?, names: [String]) -> InferletRequest? {
-    guard let data = try? JSONEncoder().encode(BestOfNReleaseInput(model: modelID, release: names))
+  private static func makeBestOfNReleaseRequest(
+    modelID: String?, roundID: String, names: [String]
+  ) -> InferletRequest? {
+    guard let data = try? JSONEncoder().encode(
+      BestOfNReleaseInput(model: modelID, roundID: roundID, release: names))
     else { return nil }
     return InferletRequest(inferlet: "best-of-n", input: data, messages: nil, stream: false)
   }
@@ -1182,8 +1381,10 @@ public final class ChatSendController: ObservableObject {
 /// JSON body for the tree-of-thought advanced-profile dispatch `input`.
 /// snake_case keys mirror the engine's `TotInput` schema; `temperature` /
 /// `top_p` come from the shared sampling, the rest from the ToT profile.
-private struct ToTRequestInput: Encodable {
+struct ToTRequestInput: Encodable {
   let model: String
+  /// Conversation identity for the shared KV boundary (see gen-core).
+  let boundary: ChatCacheDirective?
   let messages: [ChatMessage]
   let breadth: Int
   let depth: Int
@@ -1192,8 +1393,12 @@ private struct ToTRequestInput: Encodable {
   let temperature: Double
   let topP: Double
 
+  // An explicit CodingKeys suppresses synthesis for anything absent, so a
+  // property missing here is dropped silently — it still compiles and still
+  // type-checks. `boundary` was missing, which meant ToT dispatches carried no
+  // conversation identity and chat -> ToT -> chat could never reuse KV.
   private enum CodingKeys: String, CodingKey {
-    case model, messages, breadth, depth, temperature
+    case model, boundary, messages, breadth, depth, temperature
     case beamWidth = "beam_width"
     case maxTokensPerNode = "max_tokens_per_node"
     case topP = "top_p"
@@ -1203,8 +1408,13 @@ private struct ToTRequestInput: Encodable {
 /// Advanced-profile dispatch body for a Best-of-N round (#690). Round-1 leaves
 /// the resume fields nil → the synthesized `Encodable` omits them
 /// (`encodeIfPresent`), so the server reads it as a fresh round.
-private struct BestOfNRequestInput: Encodable {
+struct BestOfNRequestInput: Encodable {
   let model: String
+  /// Conversation identity for the shared KV boundary (see gen-core).
+  let boundary: ChatCacheDirective?
+  /// Authorization scope for every snapshot this round mints. The guest
+  /// refuses to mint, resume or free a candidate without it.
+  let roundID: String?
   let messages: [ChatMessage]
   let n: Int
   let maxTokensPerCandidate: Int
@@ -1217,8 +1427,10 @@ private struct BestOfNRequestInput: Encodable {
   let unpicked: [String]?
   let level: Int?
 
+  // Same omission as ToTRequestInput — see the note there.
   private enum CodingKeys: String, CodingKey {
-    case model, messages, n, temperature, level, unpicked, thinking
+    case model, boundary, messages, n, temperature, level, unpicked, thinking
+    case roundID = "round_id"
     case maxTokensPerCandidate = "max_tokens_per_candidate"
     case topP = "top_p"
     case resumeFrom = "resume_from"
@@ -1230,19 +1442,67 @@ private struct BestOfNRequestInput: Encodable {
 /// Chat-completions dispatch-envelope body for a Best-of-N snapshot-release
 /// request (#690): names to drop, no messages — the server runs no generation
 /// and acks the freed count.
+/// The §6.2 commit body: save the accepted answer's `conv/` boundary, THEN
+/// free the round's candidate KV.
+///
+/// This is a new operation, not an extension of release. Release carries only
+/// `{model, release}` — no messages, no boundary, no answer — so a committed
+/// round left nothing for the next chat turn to reuse, and Best-of-N -> chat
+/// always fell back to a shorter ladder rung.
+///
+/// `messages` MUST be the canonical history WITHOUT the accepted answer: the
+/// guest appends `assistant(answer)` itself, and the boundary it names has to
+/// be the one the next chat turn will hash. Build it with the same
+/// `transcriptTurns(chat:options:)` a generative turn uses — a missing system
+/// prompt silently names a boundary nothing ever asks for.
+private struct BestOfNCommitInput: Encodable {
+  let model: String
+  let boundary: ChatCacheDirective?
+  let roundID: String
+  let messages: [ChatMessage]
+  let commit: Commit
+
+  struct Commit: Encodable {
+    /// The candidate the user accepted. Must belong to `roundID`.
+    let snapshotName: String
+    /// Byte-identical to the text persisted as the assistant message.
+    let answer: String
+    /// Every snapshot the round minted, including the selected one.
+    let release: [String]
+
+    private enum CodingKeys: String, CodingKey {
+      case answer, release
+      case snapshotName = "snapshot_name"
+    }
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case model, boundary, messages, commit
+    case roundID = "round_id"
+  }
+}
+
 private struct BestOfNReleaseInput: Encodable {
   /// Omitted when nil (`encodeIfPresent`) so the engine resolves its served
   /// model — the delete path has no gate to supply a model id.
   let model: String?
+  /// Required: without it the guest has no authorization scope and refuses
+  /// every name rather than falling back to a guard that would authorize every
+  /// round of every chat.
+  let roundID: String
   let release: [String]
 
   func encode(to encoder: Encoder) throws {
     var c = encoder.container(keyedBy: CodingKeys.self)
     try c.encodeIfPresent(model, forKey: .model)
+    try c.encode(roundID, forKey: .roundID)
     try c.encode(release, forKey: .release)
   }
 
-  private enum CodingKeys: String, CodingKey { case model, release }
+  private enum CodingKeys: String, CodingKey {
+    case model, release
+    case roundID = "round_id"
+  }
 }
 
 /// The unary `application/json` ack `bestofn::release::dispatch_release` returns
@@ -1255,6 +1515,46 @@ struct BestOfNReleaseAck: Decodable, Equatable {
   let requested: Int
   let released: Int
   let absent: Int
+  /// Names the guest refused to delete because they were not provably this
+  /// round's. Distinct from `absent`, which is benign — a refusal means the
+  /// client asked to free something it could not prove it owned.
+  /// Defaulted so an older engine's ack still decodes.
+  let refused: Int
+
+  private enum CodingKeys: String, CodingKey {
+    case requested, released, absent, refused
+  }
+
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    requested = try c.decode(Int.self, forKey: .requested)
+    released = try c.decode(Int.self, forKey: .released)
+    absent = try c.decode(Int.self, forKey: .absent)
+    refused = try c.decodeIfPresent(Int.self, forKey: .refused) ?? 0
+  }
+
+  init(requested: Int, released: Int, absent: Int, refused: Int = 0) {
+    self.requested = requested
+    self.released = released
+    self.absent = absent
+    self.refused = refused
+  }
+}
+
+/// The §6.2 commit ack. `boundarySaved` is the load-bearing field: the guest
+/// deletes NOTHING unless it is true, so a false here means the round's KV is
+/// still live and still the client's to free.
+struct BestOfNCommitAck: Decodable, Equatable {
+  let boundarySaved: Bool
+  let requested: Int
+  let released: Int
+  let absent: Int
+  let refused: Int
+
+  private enum CodingKeys: String, CodingKey {
+    case boundarySaved = "boundary_saved"
+    case requested, released, absent, refused
+  }
 }
 
 /// Failure constructing a tree-of-thought send.

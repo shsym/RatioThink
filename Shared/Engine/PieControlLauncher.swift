@@ -328,6 +328,17 @@ public enum PieControlLauncher {
     public var pieBinary: URL
     public var wasmURL: URL
     public var manifestURL: URL
+    /// Which backend serves chat for THIS launch.
+    ///
+    /// Carried on the spec rather than read from the process environment:
+    /// `launch()` runs inside the launchd-managed helper, so an app-side
+    /// `launchEnvironment` never reaches it and `RATIO_CHAT_BACKEND` could only
+    /// be set with `launchctl setenv` — global, sticky, and invisible to the
+    /// app. As a spec field the choice travels with the start request, so the
+    /// app can flip back under load without touching launchd state.
+    ///
+    /// Defaults to `.daemon`, which keeps every existing construction valid.
+    public var chatBackend: ChatBackend = .daemon
     /// Process env to give the spawned `pie serve`. The launcher
     /// overlays `PIE_HOME` and `PIE_SHMEM_NAME` on top of this; the
     /// caller is responsible for any sanitization (see
@@ -836,34 +847,34 @@ public enum PieControlLauncher {
     // reconnects on demand.
     await session.recordControlWSURL(wsURL)
     let client = PieControlClient(url: wsURL)
+    let backend = spec.chatBackend
     let httpPort: UInt16
     do {
       try await client.connect()
       try await client.authByToken(handshake.token)
-      try await client.installProgram(wasmURL: spec.wasmURL,
-                                      manifestURL: spec.manifestURL,
-                                      forceOverwrite: true)
-      // pass port 0 so pie's inferlet daemon binds an OS-assigned free
-      // port at bind time, then learn the actual port from pie's own "Daemon
-      // serving HTTP on …" log line. This eliminates the old
-      // reserve-bind-close-reuse TOCTOU in `reserveFreePort()`: an App-chosen
-      // port could be stolen in the window between our `close()` and pie's
-      // later `bind()`. With the OS choosing at bind time the port cannot be
-      // stolen, and nobody but pie knows it until it is already bound.
-      //
-      // build-9 fix: that line is `tracing::info!` → it lands ONLY in
-      // <pieHome>/logs/pie.log, NEVER on the captured stdout (build-8 watched
-      // stdout and hung 30s every launch). Snapshot the log cursor BEFORE
-      // launch_daemon so the post-launch scan can't pick up a stale port from
-      // an earlier same-day launch sharing the rolling daily file.
-      let logCursor = PieControlLauncher.daemonLogCursor(pieHome: spec.pieHome)
-      try await client.launchDaemon(
-        inferlet: spec.inferletNameAtVersion,
-        port: 0,
-        host: spec.daemonBindHost.daemonHost
-      )
-      httpPort = try await session.awaitDaemonPort(
-        baseline: logCursor, timeout: PieControlLauncher.daemonBindTimeout)
+      // The chat-apc wasm is only needed by the daemon path; the gateway
+      // installs its own inferlets over its own connection.
+      if backend == .daemon {
+        try await client.installProgram(wasmURL: spec.wasmURL,
+                                        manifestURL: spec.manifestURL,
+                                        forceOverwrite: true)
+      }
+      // PIE binds port 0 atomically. Capture the log cursor first so port
+      // discovery cannot reuse an older launch's entry.
+      if backend == .daemon {
+        let logCursor = PieControlLauncher.daemonLogCursor(pieHome: spec.pieHome)
+        try await client.launchDaemon(
+          inferlet: spec.inferletNameAtVersion,
+          port: 0,
+          host: spec.daemonBindHost.daemonHost
+        )
+        httpPort = try await session.awaitDaemonPort(
+          baseline: logCursor, timeout: PieControlLauncher.daemonBindTimeout)
+      } else {
+        // Gateway mode: no daemon, so no daemon port. The gateway's own port
+        // is published below and is what the app will use.
+        httpPort = 0
+      }
       await client.close()
     } catch is CancellationError {
       _ = await session.residentMemoryBytes()
@@ -893,6 +904,39 @@ public enum PieControlLauncher {
         )
       }
       throw LaunchError.clientError(underlying: "\(error)")
+    }
+
+    if backend == .gateway {
+      // The helper is nested inside Rational.app, where gateway assets live.
+      let supervisor = GatewaySupervisor()
+      do {
+        let staged = try InferletResources.gateway()
+        let gatewayPort = try await supervisor.start(
+          spec: GatewaySupervisor.Spec(
+            binary: staged.binary,
+            inferlets: staged.inferlets,
+            pieURL: "ws://\(handshake.address)",
+            pieToken: handshake.token))
+        await session.adoptGateway(supervisor)
+        do {
+          try writePortFile(port: gatewayPort, in: spec.pieHome)
+        } catch {
+          let shutdownResult = await session.shutdown(reason: "launch.port_file_failed")
+          if !shutdownResult.reaped {
+            throw LaunchError.shutdownFailed(
+              underlying: "\(error)", shutdownFailure: shutdownResult.message)
+          }
+          throw error
+        }
+        return (gatewayPort, session)
+      } catch {
+        let shutdownResult = await session.shutdown(reason: "launch.gateway_failed")
+        if !shutdownResult.reaped {
+          throw LaunchError.shutdownFailed(
+            underlying: "\(error)", shutdownFailure: shutdownResult.message)
+        }
+        throw error
+      }
     }
 
     do {
@@ -1271,6 +1315,7 @@ public actor LaunchedSession {
   private var outputTailerStarted = false
   private var maxResidentMemoryBytes: UInt64?
   private var shutdownDone = false
+  private var shutdownTask: Task<EngineShutdownResult, Never>?
   /// Control-plane WS address, retained post-handshake so liveness
   /// probes can reconnect ( G1). `nil` until `launch()` records it.
   private var controlWSURL: URL?
@@ -1425,6 +1470,15 @@ public actor LaunchedSession {
     if !process.isRunning {
       return .gone(reason: "engine process exited (\(terminationDescription()))")
     }
+    // Third signal: in gateway mode the port the app is pinned to belongs to
+    // ratio-gateway, not pie. A dead gateway with a healthy engine used to
+    // leave EngineStatus `.running` against a dead port forever, because
+    // nothing probed it after startup. Checked BEFORE the engine ping: if the
+    // gateway is gone the app cannot reach anything, so the engine's health is
+    // moot and the restart ladder should fire on the real cause.
+    if let gateway, let reason = await gateway.recoverIfNeeded() {
+      return .gone(reason: reason)
+    }
     guard let controlWSURL else {
       // Pre-handshake (address not yet recorded): the process is up;
       // defer to the next probe rather than declaring a false death.
@@ -1480,15 +1534,33 @@ public actor LaunchedSession {
     await shutdown(reason: "unspecified")
   }
 
-  public func shutdown(reason: String) async -> EngineShutdownResult {
-    guard !shutdownDone else {
-      return process.isRunning
-        ? .unreaped("shutdown was already requested but pid \(process.processIdentifier) is still running")
-        : .reaped
-    }
-    shutdownDone = true
+  /// Ties a supervised `ratio-gateway` to this engine session so teardown is
+  /// a single call — an orphaned gateway would keep a loopback listener bound
+  /// and the next launch would fight it for the port.
+  private var gateway: GatewaySupervisor?
 
+  public func adoptGateway(_ supervisor: GatewaySupervisor) {
+    gateway = supervisor
+  }
+
+  public func shutdown(reason: String) async -> EngineShutdownResult {
+    if let shutdownTask { return await shutdownTask.value }
+    let task = Task { await self.performShutdown(reason: reason) }
+    shutdownTask = task
+    return await task.value
+  }
+
+  private func performShutdown(reason: String) async -> EngineShutdownResult {
+    shutdownDone = true
     var failures: [String] = []
+    if let gateway {
+      let gatewayResult = await gateway.shutdown(reason: reason)
+      self.gateway = nil
+      if !gatewayResult.reaped {
+        failures.append(gatewayResult.message)
+      }
+    }
+
     let pid = process.processIdentifier
     let wasRunning = process.isRunning
     DiagnosticLog.helper.event("engine.shutdown", [
@@ -1574,7 +1646,7 @@ public actor LaunchedSession {
     // reaped cleanly — drop ownership so neither the exit handler nor the
     // next-launch backstop targets an already-dead (or recycled) pid.
     EngineReaper.release()
-    return .reaped
+    return failures.isEmpty ? .reaped : .unreaped(failures.joined(separator: "; "))
   }
 
   /// Reads stdout until both handshake markers appear or the

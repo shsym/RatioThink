@@ -1,0 +1,35 @@
+# Uses the dummy driver: no weights are loaded and no compute runs, so process
+# launch is fast enough to stress the launch/emit/cancel path thousands of
+# times. `hf_repo` must still resolve to a snapshot carrying a tokenizer —
+# only weight loading and compute are skipped (Vendor/pie/driver/dummy/README.md).
+
+[server]
+host = "127.0.0.1"
+port = 0
+verbose = false
+
+[auth]
+enabled = false
+
+[telemetry]
+enabled = false
+
+[runtime]
+allow_fs = false
+allow_network = true
+
+[[model]]
+name = "dummy"
+hf_repo = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+
+[model.scheduler]
+batch_policy = "adaptive"
+request_timeout_secs = 60
+
+[model.driver]
+type = "dummy"
+device = ["cpu"]
+
+[model.driver.options]
+vocab_size = 152064
+arch_name = "qwen2"

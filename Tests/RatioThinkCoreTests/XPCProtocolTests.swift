@@ -612,7 +612,7 @@ final class XPCProtocolTests: XCTestCase {
     // `startEngineWithProfileID:daemonBindHost:reply:` selector (Local API
     // external-access toggle), so stale v6 helpers must also be repaired. Pin
     // the version so a future wire/selector change fails here until it is bumped.
-    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 7,
+    XCTAssertEqual(HelperProtocolCompatibility.currentVersion, 8,
                    "bump currentVersion whenever a REQUIRED PieHelperXPC selector is added OR reply/status wire BYTES change")
   }
 

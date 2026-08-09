@@ -1046,10 +1046,32 @@ struct ChatScaffoldView: View {
           reportSave(Self.missingBestOfNCandidateTextError(nodeID: id, messageID: messageID))
           return
         }
+        // §6.2 commit. PREPARED FIRST, while `message.content` is still empty:
+        // an assistant row with no content is excluded from request history, so
+        // this captures the canonical conversation WITHOUT the accepted answer
+        // — which is what the guest appends itself. Preparing after the commit
+        // would name a boundary containing the answer twice.
+        let prepared = bestOfNSendOptions(for: chat).flatMap {
+          ChatSendController.prepareBestOfNCommit(
+            chat: chat, options: $0, round: round, answer: text)
+        }
         let snapshots = round.candidates.map(\.snapshotName)
         Self.performBestOfNStop(
           text: text, on: message, save: saveContext, report: reportSave,
-          releaseSnapshots: { self.releaseBestOfNSnapshots(snapshots, in: chat) })
+          releaseSnapshots: {
+            // Still gated on a durable save: a rejected commit must not discard
+            // the recovery state.
+            if ChatBackend.fromEnvironment() == .gateway, let prepared {
+              sendCoordinator.controller(for: chatID)
+                .dispatchBestOfNCommit(prepared, engine: engineStore.client)
+            } else {
+              // No round scope (a round persisted before it existed), or no
+              // options. Fall back to the old behaviour: free the KV, write no
+              // boundary. The next chat turn pays a re-prefill.
+              self.releaseBestOfNSnapshots(
+                snapshots, roundID: round.roundID, in: chat)
+            }
+          })
         bestOfNCommentDrafts[messageID] = nil
       } else {
         try? modelContext.save()
@@ -1059,7 +1081,14 @@ struct ChatScaffoldView: View {
       guard let chosen = round.chosen,
             let pickedText = bestOfNCandidateText(message: message, nodeID: chosen.id)
       else { return }
+      // A think-more CONTINUES this round, so it carries this round's scope.
+      // The guest authorizes `resume_from` and the `unpicked` deletes against
+      // it; a fresh scope makes every one of those names belong to a different
+      // round. A round with no scope cannot be resumed at all — it predates the
+      // field — so those fall through to the guard below.
+      guard let roundID = round.roundID, !roundID.isEmpty else { return }
       let resume = ChatSendController.BestOfNResume(
+        roundID: roundID,
         pickedName: chosen.snapshotName,
         pickedText: pickedText,
         selectedComment: selectedComment,
@@ -1159,10 +1188,12 @@ struct ChatScaffoldView: View {
 
   /// Best-effort release of a set of Best-of-N candidate KV snapshots (#690
   /// terminal cleanup). No-op when the engine is not ready or the set is empty.
-  private func releaseBestOfNSnapshots(_ names: [String], in chat: Chat) {
+  private func releaseBestOfNSnapshots(
+    _ names: [String], roundID: String?, in chat: Chat
+  ) {
     guard !names.isEmpty, case .ready(let modelID) = sendGateDecision(for: chat) else { return }
     sendCoordinator.controller(for: chatID).releaseBestOfNSnapshots(
-      engine: engineStore.client, modelID: modelID, snapshotNames: names)
+      engine: engineStore.client, modelID: modelID, roundID: roundID, snapshotNames: names)
   }
 
   /// Abandon cleanup (#690): when the user starts a NEW turn instead of
@@ -1172,18 +1203,28 @@ struct ChatScaffoldView: View {
   /// content but carries a decoded pick set; releasing already-freed names is a harmless
   /// no-op (the server reports them absent), so this is safe to run each turn.
   private func releaseAbandonedBestOfNRounds(in chat: Chat) {
-    let names = BestOfNRound.uncommittedCandidateSnapshotNames(in: chat.messages)
-    releaseBestOfNSnapshots(names, in: chat)
+    // One request PER ROUND: a release is authorized against a single
+    // `round_id`, so a flat list spanning rounds would have most of it refused.
+    for round in BestOfNRound.uncommittedRounds(in: chat.messages) {
+      releaseBestOfNSnapshots(round.names, roundID: round.roundID, in: chat)
+    }
   }
 
   /// Send Best-of-N round 2 expanding from the user's level-1 pick and
   /// refinement comment. Mirrors the round-1 route in `sendAssistantTurn` but
   /// threads the `resume` payload.
-  private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) -> Bool {
-    guard let modelID = resolvedModelIDForSend(for: chat) else { return false }
-    guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
-          let bonConfig = bonProfile.bestOfN else { return false }
-    let options = ChatSendRequestOptions(
+  /// The send options a Best-of-N request uses.
+  ///
+  /// Factored out because the COMMIT must digest the same conversation the
+  /// round did: the boundary name hashes `transcriptTurns`, which prepends
+  /// `systemPromptOverride`. A commit assembled from different options would
+  /// name a boundary the next chat turn never asks for — no error, just a
+  /// permanently cold turn.
+  private func bestOfNSendOptions(for chat: Chat) -> ChatSendRequestOptions? {
+    guard let modelID = resolvedModelIDForSend(for: chat),
+          let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID)
+    else { return nil }
+    return ChatSendRequestOptions(
       modelID: modelID,
       sampling: bonProfile.bestOfNRequestSampling,
       systemPromptOverride: Self.resolvedSystemPrompt(
@@ -1194,6 +1235,12 @@ struct ChatScaffoldView: View {
       maxOutputTokensCeiling: modelLoadCenter.residentMaxOutputTokens,
       kvUsageSnapshot: engineStatusStore.kvUsageSnapshot(for: modelID),
       responseFormat: nil)
+  }
+
+  private func sendBestOfNRound(for chat: Chat, resume: ChatSendController.BestOfNResume) -> Bool {
+    guard let bonProfile = profileStore.profile(forProfileID: viewModel.selectedProfileID),
+          let bonConfig = bonProfile.bestOfN,
+          let options = bestOfNSendOptions(for: chat) else { return false }
     sendCoordinator.controller(for: chatID).sendBestOfN(
       chat: chat,
       context: modelContext,

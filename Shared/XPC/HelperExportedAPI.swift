@@ -114,6 +114,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// `EngineError(.profileMissing, …)` rather than synthesizing a
   /// bogus spec.
   private let launchSpecResolver: LaunchSpecResolver?
+  private let launchSpecBackendSetter: ((ChatBackend) -> Void)?
 
   /// Owns the `ModelDownloader` for this helper process. Wired in
   /// Phase 2.5. Eagerly constructed so the first `downloadModel`
@@ -151,6 +152,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   public override init() {
     self.engineHost = nil
     self.launchSpecResolver = nil
+    self.launchSpecBackendSetter = nil
     self.downloader = ModelDownloader()
     self.onQuitRequested = nil
     #if DEBUG
@@ -161,9 +163,11 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   public init(engineHost: PieEngineHost? = nil,
               launchSpecResolver: LaunchSpecResolver? = nil,
+              launchSpecBackendSetter: ((ChatBackend) -> Void)? = nil,
               onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.engineHost = engineHost
     self.launchSpecResolver = launchSpecResolver
+    self.launchSpecBackendSetter = launchSpecBackendSetter
     self.downloader = ModelDownloader()
     self.onQuitRequested = onQuitRequested
     #if DEBUG
@@ -181,9 +185,11 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   internal init(engineHost: PieEngineHost?,
                 launchSpecResolver: LaunchSpecResolver?,
                 replyTimeoutOverride: (start: TimeInterval, stop: TimeInterval)?,
+                launchSpecBackendSetter: ((ChatBackend) -> Void)? = nil,
                 onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.engineHost = engineHost
     self.launchSpecResolver = launchSpecResolver
+    self.launchSpecBackendSetter = launchSpecBackendSetter
     self.downloader = ModelDownloader()
     self.onQuitRequested = onQuitRequested
     self.replyTimeoutOverride = replyTimeoutOverride
@@ -339,24 +345,47 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// reply blocks may be invoked from any thread so the observer
   /// is self-cancelling via the token argument from
   /// `PieEngineHost.observe` (review v1 F3) — no tokenBox race.
+  /// Backend-aware start. Delegates to the existing path after recording the
+  /// caller's choice, so the gateway/daemon decision travels with the request
+  /// instead of depending on the helper's launchd environment.
+  public func startEngineWithBackend(profileID: String,
+                                     modelOverride: String?,
+                                     chatBackend: String,
+                                     reply: @escaping (Data?, Data?) -> Void) {
+    startEngine(
+      profileID: profileID,
+      modelOverride: modelOverride,
+      backend: ChatBackend(rawValue: chatBackend.lowercased()) ?? .daemon,
+      reply: reply)
+  }
+
   public func startEngine(profileID: String,
                           modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
+    startEngine(profileID: profileID, modelOverride: modelOverride, backend: .daemon, reply: reply)
+  }
+
+  private func startEngine(profileID: String,
+                           modelOverride: String?,
+                           backend: ChatBackend,
+                           reply: @escaping (Data?, Data?) -> Void) {
     guard let engineHost else {
       Self.log.error("startEngine: no engineHost wired (early boot or unit test)")
       reply(nil, Self.notImplementedErrorData)
       return
     }
+    launchSpecBackendSetter?(backend)
     // No explicit bind host on this path: the resolver injects the
     // file-backed persisted Local API bind mode into the spec, so a
     // model-pick start still inherits the user's exposure preference.
-    guard let spec = resolveLaunchSpec(profileID: profileID,
+    guard var spec = resolveLaunchSpec(profileID: profileID,
                                        explicitModel: modelOverride,
                                        engineHost: engineHost,
                                        operation: "startEngine",
                                        reply: reply) else {
       return
     }
+    spec.chatBackend = backend
     let replied = OSAllocatedUnfairLock<Bool>(initialState: false)
     func fireOnce(_ result: Result<EngineSessionSnapshot, EngineError>) {
       let already = replied.withLock { (fired: inout Bool) -> Bool in
@@ -977,6 +1006,13 @@ public final class DegradedHelperAPI: NSObject, PieHelperXPC {
                           modelOverride: String?,
                           reply: @escaping (Data?, Data?) -> Void) {
     Self.log.error("startEngine refused in degraded mode (profileID=\(profileID, privacy: .public))")
+    reply(nil, degradedErrorData)
+  }
+
+  public func startEngineWithBackend(profileID: String,
+                                     modelOverride: String?,
+                                     chatBackend: String,
+                                     reply: @escaping (Data?, Data?) -> Void) {
     reply(nil, degradedErrorData)
   }
 

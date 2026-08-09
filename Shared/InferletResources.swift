@@ -53,6 +53,33 @@ public enum InferletResources {
     return (wasm, manifest)
   }
 
+  /// Path components written by the `Build ratio-gateway` postCompileScript.
+  private static let gatewaySubdir = "gateway"
+  private static let gatewayBinaryName = "ratio-gateway"
+
+  /// Resolves the bundled `ratio-gateway` binary and its inferlet directory.
+  ///
+  /// Uses the SAME nested-bundle walk as `pieControl`: in production this runs
+  /// inside `RationalHelper.app`, while the gateway is staged in the
+  /// containing `Rational.app`. `Bundle.main.resourceURL` therefore points at
+  /// the helper and finds nothing — the bug this exists to prevent.
+  public static func gateway(in bundle: Bundle = .main) throws
+    -> (binary: URL, inferlets: URL)
+  {
+    let searchBundles = candidateBundles(starting: bundle)
+    for b in searchBundles {
+      guard let root = b.resourceURL?.appendingPathComponent(gatewaySubdir, isDirectory: true)
+      else { continue }
+      let binary = root.appendingPathComponent(gatewayBinaryName)
+      if FileManager.default.isExecutableFile(atPath: binary.path) {
+        return (binary, root.appendingPathComponent("inferlets", isDirectory: true))
+      }
+    }
+    throw LookupError.missingWasm(
+      name: gatewayBinaryName,
+      searched: searchBundles.compactMap { $0.resourceURL?.path })
+  }
+
   // MARK: - private
 
   /// Canonical embed layout is

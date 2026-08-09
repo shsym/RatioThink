@@ -1,0 +1,40 @@
+[package]
+name = "tot-core"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-independent tree search: beam expansion, scoring, pruning, synthesis. Emits ratio-wire Events; knows nothing about HTTP."
+
+# An rlib, not a cdylib: only crates with `#[inferlet::main]` are wasm
+# components. `tot.wasm` is the component; this is the logic it links.
+#
+# Milestone C reuses this crate directly — chat-apc's Best-of-N is built on the
+# same `generate_branch` primitive as tree search (chat-apc/src/tot/branch.rs
+# :1-29), so the split has to keep that primitive public rather than bury it in
+# the search loop.
+
+[features]
+# Carried over from chat-apc verbatim (its Cargo.toml:10-20). Default OFF, so
+# `resolve` accepts only `coupled_sequential` and rejects any other `exec` with
+# a curated 400 naming `param: "exec"`.
+#
+# The tempting simplification — delete the phased variants, since they are a
+# measured no-win benchmark apparatus — would make that rejection unreachable:
+# with the variants gone, `exec: "phased_concurrent"` fails inside
+# `serde_json::from_value::<TotInput>` instead of inside `resolve`, producing a
+# generic serde message with `param: null` rather than the curated error. The
+# variants stay deserializable precisely so the gate keeps its shape.
+exec-strategies = []
+
+[dependencies]
+inferlet = { path = "../../Vendor/pie/sdk/rust/inferlet" }
+ratio-wire = { path = "../ratio-wire" }
+ratio-names = { path = "../ratio-names" }
+gen-core = { path = "../gen-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+
+# Host `cargo test --lib` works despite the SDK dependency, the same way
+# gen-core's does: wit-bindgen's extern declarations link as long as the tests
+# never call them. The pure modules (diversity, tree, schema) are fully
+# host-testable; the search loop is not.

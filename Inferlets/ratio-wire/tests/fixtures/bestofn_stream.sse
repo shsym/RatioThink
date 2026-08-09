@@ -1,0 +1,516 @@
+data: {"event":"tree_start","id":"bon-0","model":"qwen","breadth":5,"depth":1,"beam_width":1}
+
+data: {"event":"node_start","id":"bon-n1","parent_id":"root","depth":1,"branch_index":0}
+
+data: {"event":"node_start","id":"bon-n2","parent_id":"root","depth":1,"branch_index":1}
+
+data: {"event":"node_start","id":"bon-n3","parent_id":"root","depth":1,"branch_index":2}
+
+data: {"event":"node_start","id":"bon-n4","parent_id":"root","depth":1,"branch_index":3}
+
+data: {"event":"node_start","id":"bon-n5","parent_id":"root","depth":1,"branch_index":4}
+
+data: {"event":"node_delta","id":"bon-n1","kind":"answer","text":"3"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"One"}
+
+data: {"event":"node_delta","id":"bon-n3","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"The"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":"2"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n3","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n3","kind":"answer","text":"3"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"2"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" a"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"7"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" a"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":","}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" To"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" representing"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" explain"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" the"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" smallest"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":","}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" Note"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" a"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" that"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" and"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" only"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"2"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" even"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" a"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" the"}
+
+data: {"event":"node_delta","id":"bon-n5","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" natural"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" only"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" even"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" greater"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" than"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" For"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" that"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" all"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" has"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" other"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" no"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" positive"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" numbers"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" div"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":","}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"isors"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" they"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" other"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" are"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" than"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" odd"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" Prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" and"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" numbers"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" itself"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" are"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" natural"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" Let"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" numbers"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"'s"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" greater"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" verify"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" than"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"7"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":":\n\n"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" that"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" have"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" no"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" It"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" positive"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" div"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" greater"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"isors"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" than"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" other"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" than"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":".\n"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"2"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" and"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" themselves"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" Its"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" only"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" As"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" div"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" of"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"isors"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" my"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" are"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" last"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" update"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"1"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":","}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" and"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" there"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"7"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" no"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":".\n"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" known"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"3"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" largest"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" It"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" cannot"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":","}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" be"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" and"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" divided"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" new"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" evenly"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" larger"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" by"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" numbers"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" any"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" other"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" are"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" discovered"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":".\n\n"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":" regularly"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"To"}
+
+data: {"event":"node_delta","id":"bon-n4","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" further"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" illustrate"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":","}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" let"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"'s"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" consider"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" the"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" numbers"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" around"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"7"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":":\n"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"-"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"6"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" not"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" because"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" it"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" can"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" be"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" divided"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" by"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"2"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" and"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"3"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":".\n"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"-"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"8"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" not"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" because"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" it"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" can"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" be"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" divided"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" by"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"2"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" and"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"4"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":".\n"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"-"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"9"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" not"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" because"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" it"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" can"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" be"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" divided"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" by"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"3"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":".\n\n"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"Thus"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":","}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"7"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" fits"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" the"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" definition"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" of"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" a"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":" perfectly"}
+
+data: {"event":"node_delta","id":"bon-n2","kind":"answer","text":"."}
+
+data: {"event":"node_complete","node":{"id":"bon-n1","parent_id":"root","depth":1,"branch_index":0,"content":"3","score":null,"status":"ok"}}
+
+data: {"event":"node_complete","node":{"id":"bon-n2","parent_id":"root","depth":1,"branch_index":1,"content":"One prime number is 7. To explain, a prime number is a natural number greater than 1 that has no positive divisors other than 1 and itself. Let's verify 7:\n\n1. It is greater than 1.\n2. Its only divisors are 1 and 7.\n3. It cannot be divided evenly by any other number.\n\nTo further illustrate, let's consider the numbers around 7:\n- 6 is not prime because it can be divided by 2 and 3.\n- 8 is not prime because it can be divided by 2 and 4.\n- 9 is not prime because it can be divided by 3.\n\nThus, 7 fits the definition of a prime number perfectly.","score":null,"status":"ok"}}
+
+data: {"event":"node_complete","node":{"id":"bon-n3","parent_id":"root","depth":1,"branch_index":2,"content":"113","score":null,"status":"ok"}}
+
+data: {"event":"node_complete","node":{"id":"bon-n4","parent_id":"root","depth":1,"branch_index":3,"content":"The number 2 is a prime number. Note that 2 is the only even prime number. For all other prime numbers, they are odd. Prime numbers are natural numbers greater than 1 that have no positive divisors other than 1 and themselves. As of my last update, there is no known largest prime number, and new larger prime numbers are discovered regularly.","score":null,"status":"ok"}}
+
+data: {"event":"node_complete","node":{"id":"bon-n5","parent_id":"root","depth":1,"branch_index":4,"content":"2 is a prime number, representing the smallest and only even prime.","score":null,"status":"ok"}}
+
+data: {"event":"level_pruned","level":1,"kept":["bon-n1","bon-n2","bon-n3","bon-n4","bon-n5"]}
+
+data: {"event":"awaiting_selection","level":1,"candidates":[{"id":"bon-n1","branch_index":0,"snapshot_name":"bon/bon-0/1/0"},{"id":"bon-n2","branch_index":1,"snapshot_name":"bon/bon-0/1/1"},{"id":"bon-n3","branch_index":2,"snapshot_name":"bon/bon-0/1/2"},{"id":"bon-n4","branch_index":3,"snapshot_name":"bon/bon-0/1/3"},{"id":"bon-n5","branch_index":4,"snapshot_name":"bon/bon-0/1/4"}]}
+
+data: [DONE]
+

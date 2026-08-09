@@ -1,0 +1,16 @@
+[package]
+name = "pie-conformance"
+version = "0.1.0"
+edition = "2024"
+description = "Checks PIE process event delivery and cooperative cancellation."
+
+[[bin]]
+name = "pie-conformance"
+path = "src/main.rs"
+
+[dependencies]
+pie-client = { path = "../../Vendor/pie/client/rust" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }

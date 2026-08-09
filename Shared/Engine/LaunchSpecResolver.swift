@@ -112,7 +112,10 @@ public struct LaunchSpecResolver {
   /// Captures `self` so the helper can hold the closure for the
   /// lifetime of the XPC listener.
   public var asClosure: HelperExportedAPI.LaunchSpecResolver {
-    { id, explicitModel in self.resolveLauncherSpec(profileID: id, explicitModel: explicitModel) }
+    { id, explicitModel in
+      self.resolveLauncherSpec(profileID: id, explicitModel: explicitModel,
+                               chatBackend: self.chatBackend)
+    }
   }
 
   /// `PieControlLauncher`-shaped resolver. Composes the
@@ -134,8 +137,21 @@ public struct LaunchSpecResolver {
   /// profile id keeps it race-free against the helper's own FS-watched
   /// `ProfileStore` (which may not yet have observed an App-side default
   /// write). `nil`/blank falls back to the profile's persisted default.
+  /// Backend for the next launch, set from the XPC start request by
+  /// `HelperExportedAPI`. Held here rather than passed through the spec-builder
+  /// closure so that closure keeps its `(profileID, explicitModel)` shape and
+  /// its existing test seams stay valid.
+  private let chatBackendState = OSAllocatedUnfairLock(initialState: ChatBackend.daemon)
+
+  public var chatBackend: ChatBackend {
+    get { chatBackendState.withLock { $0 } }
+    nonmutating set { chatBackendState.withLock { $0 = newValue } }
+  }
+
   public func resolveLauncherSpec(profileID: String,
-                                  explicitModel: String? = nil) -> Result<PieControlLauncher.LaunchSpec, EngineError> {
+                                  explicitModel: String? = nil,
+                                  chatBackend: ChatBackend = .daemon)
+    -> Result<PieControlLauncher.LaunchSpec, EngineError> {
     // #702: a dangling active-profile marker (id points at a deleted /
     // unparseable profile) must NOT strand engine start. The base `chat`
     // built-in is always present in the effective set, so fall back to it
@@ -260,7 +276,7 @@ public struct LaunchSpecResolver {
           ("applied_request_timeout_secs", String(requestTimeoutSeconds)),
         ])
       }
-      let spec = try PieControlLauncher.LaunchSpec(
+      var spec = try PieControlLauncher.LaunchSpec(
         pieBinary: binary,
         wasmURL: resources.wasm,
         manifestURL: resources.manifest,
@@ -293,6 +309,8 @@ public struct LaunchSpecResolver {
       // the profile default. Best-effort (`try?`): a marker write failure
       // logs inside `setActiveModelID` but must never fail the launch.
       try? profileStore.setActiveModelID(model)
+      // Carried from the XPC start request, not the helper's environment.
+      spec.chatBackend = chatBackend
       return .success(spec)
     } catch {
       Self.log.error("launcher spec construction failed for profile=\(profile.id, privacy: .public): \(String(describing: error), privacy: .public)")

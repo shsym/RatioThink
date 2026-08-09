@@ -1,0 +1,11 @@
+[package]
+name = "ratio-wire"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-neutral event vocabulary, envelope, and OpenAI SSE renderer. Compiles for host AND wasm32-wasip2."
+
+# Host and guest both depend on this, so the dependency set must stay pure:
+# no wstd, no inferlet SDK, no tokio.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

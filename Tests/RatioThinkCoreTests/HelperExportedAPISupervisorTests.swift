@@ -420,6 +420,54 @@ final class HelperExportedAPISupervisorTests: XCTestCase {
 
   // MARK: - restartEngine
 
+  func test_startEngineWithBackend_preservesGatewayAcrossRestart() throws {
+    let selectedBackend = OSAllocatedUnfairLock(initialState: ChatBackend.daemon)
+    let resolvedBackends = OSAllocatedUnfairLock(initialState: [ChatBackend]())
+    let launchCount = OSAllocatedUnfairLock(initialState: 0)
+    let host = PieEngineHost(launcher: { _ in
+      let count = launchCount.withLock { count -> Int in
+        count += 1
+        return count
+      }
+      return (port: EnginePort(32000 + count), session: FakeSession())
+    })
+    let baseSpec = makeSpec(profileID: "chat")
+    let api = HelperExportedAPI(
+      engineHost: host,
+      launchSpecResolver: { _, _ in
+        let backend = selectedBackend.withLock { $0 }
+        var spec = baseSpec
+        spec.chatBackend = backend
+        resolvedBackends.withLock { $0.append(backend) }
+        return .success(spec)
+      },
+      launchSpecBackendSetter: { backend in
+        selectedBackend.withLock { $0 = backend }
+      }
+    )
+
+    let start = expectation(description: "gateway start")
+    api.startEngineWithBackend(
+      profileID: "chat", modelOverride: nil, chatBackend: ChatBackend.gateway.rawValue
+    ) { successData, errorData in
+      XCTAssertNotNil(successData)
+      XCTAssertNil(errorData)
+      start.fulfill()
+    }
+    wait(for: [start], timeout: 2)
+
+    let restart = expectation(description: "gateway restart")
+    api.restartEngine(profileID: "chat", modelOverride: nil) { successData, errorData in
+      XCTAssertNotNil(successData)
+      XCTAssertNil(errorData)
+      restart.fulfill()
+    }
+    wait(for: [restart], timeout: 2)
+
+    XCTAssertEqual(resolvedBackends.withLock { $0 }, [.gateway, .gateway])
+    host.stop()
+  }
+
   func test_restartEngine_waitsForSlowStopTerminalBeforeStartingReplacement() throws {
     let launchCount = OSAllocatedUnfairLock<Int>(initialState: 0)
     let firstSession = FakeSession(shutdownDelay: 0.3)

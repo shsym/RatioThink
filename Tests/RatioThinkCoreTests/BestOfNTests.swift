@@ -156,7 +156,8 @@ final class BestOfNTests: XCTestCase {
     let engine = ReleaseCapturingEngine()
     let controller = ChatSendController()
     controller.releaseBestOfNSnapshots(
-      engine: engine, modelID: "qwen", snapshotNames: ["bon/r/1/0", "bon/r/1/1"])
+      engine: engine, modelID: "qwen", roundID: "ROUND-1",
+      snapshotNames: ["bon/r/1/0", "bon/r/1/1"])
 
     // The release fires on a detached MainActor Task; wait for the dispatch.
     let deadline = Date().addingTimeInterval(2)
@@ -170,13 +171,29 @@ final class BestOfNTests: XCTestCase {
     let input = try JSONDecoder().decode(ReleaseWire.self, from: req.input)
     XCTAssertEqual(input.model, "qwen")
     XCTAssertEqual(input.release, ["bon/r/1/0", "bon/r/1/1"])
+    XCTAssertEqual(input.roundID, "ROUND-1",
+                   "without the round scope the guest refuses every name")
+  }
+
+  /// A round persisted before `roundID` existed carries no authorization scope.
+  /// The guest would refuse every name, so the request is skipped rather than
+  /// issued and refused — and the snapshots leak once rather than the guard
+  /// being widened to something that would authorize every round of every chat.
+  @MainActor
+  func test_releaseBestOfNSnapshots_without_a_round_scope_is_a_noop() async throws {
+    let engine = ReleaseCapturingEngine()
+    ChatSendController().releaseBestOfNSnapshots(
+      engine: engine, modelID: "qwen", roundID: nil, snapshotNames: ["bon/r/1/0"])
+    try await Task.sleep(nanoseconds: 50_000_000)
+    XCTAssertNil(engine.lastRequest, "an unscoped release must not hit the engine")
   }
 
   /// An empty release set must NOT dispatch anything (no wasted request).
   @MainActor
   func test_releaseBestOfNSnapshots_empty_is_a_noop() async throws {
     let engine = ReleaseCapturingEngine()
-    ChatSendController().releaseBestOfNSnapshots(engine: engine, modelID: "qwen", snapshotNames: [])
+    ChatSendController().releaseBestOfNSnapshots(
+      engine: engine, modelID: "qwen", roundID: "ROUND-1", snapshotNames: [])
     try await Task.sleep(nanoseconds: 50_000_000)
     XCTAssertNil(engine.lastRequest, "an empty release must not hit the engine")
   }
@@ -187,7 +204,8 @@ final class BestOfNTests: XCTestCase {
   @MainActor
   func test_releaseBestOfNSnapshots_nil_model_omits_model_field() async throws {
     let engine = ReleaseCapturingEngine()
-    ChatSendController().releaseBestOfNSnapshots(engine: engine, modelID: nil, snapshotNames: ["s0"])
+    ChatSendController().releaseBestOfNSnapshots(
+      engine: engine, modelID: nil, roundID: "ROUND-1", snapshotNames: ["s0"])
     let deadline = Date().addingTimeInterval(2)
     while Date() < deadline, engine.lastRequest == nil {
       try await Task.sleep(nanoseconds: 10_000_000)
@@ -210,7 +228,8 @@ final class BestOfNTests: XCTestCase {
       let cands = snaps.enumerated().map {
         ToTSelectionCandidate(id: "n\($0.offset)", branchIndex: $0.offset, snapshotName: $0.element)
       }
-      return try! JSONEncoder().encode(BestOfNRound(level: 1, candidates: cands, chosenID: nil))
+      return try! JSONEncoder().encode(
+        BestOfNRound(level: 1, candidates: cands, chosenID: nil, roundID: "R1"))
     }
     let uncommitted = Message(role: "assistant", content: "", bestOfN: roundData(["s0", "s1"]))
     // Committed: the user chose "Use this", so content is set — its snapshot was
@@ -227,17 +246,54 @@ final class BestOfNTests: XCTestCase {
   /// Two uncommitted rounds in one chat (e.g. a think-more chain abandoned
   /// mid-way) release ALL their candidate snapshots.
   func test_uncommitted_candidate_snapshot_names_spans_multiple_rounds() {
-    func roundData(_ snaps: [String]) -> Data {
+    func roundData(_ snaps: [String], _ id: String) -> Data {
       let cands = snaps.enumerated().map {
         ToTSelectionCandidate(id: "n\($0.offset)", branchIndex: $0.offset, snapshotName: $0.element)
       }
-      return try! JSONEncoder().encode(BestOfNRound(level: 1, candidates: cands, chosenID: nil))
+      return try! JSONEncoder().encode(
+        BestOfNRound(level: 1, candidates: cands, chosenID: nil, roundID: id))
     }
-    let r1 = Message(role: "assistant", content: "", bestOfN: roundData(["a0", "a1"]))
-    let r2 = Message(role: "assistant", content: "", bestOfN: roundData(["b0", "b1"]))
+    let r1 = Message(role: "assistant", content: "", bestOfN: roundData(["a0", "a1"], "R1"))
+    let r2 = Message(role: "assistant", content: "", bestOfN: roundData(["b0", "b1"], "R2"))
     XCTAssertEqual(
       BestOfNRound.uncommittedCandidateSnapshotNames(in: [r1, r2]),
       ["a0", "a1", "b0", "b1"])
+  }
+
+  /// The sweep must group BY ROUND. A release is authorized against a single
+  /// `round_id`, so one flat request spanning two rounds would have half its
+  /// names refused — the snapshots would silently leak while the ack reported a
+  /// benign short release.
+  func test_uncommitted_rounds_are_grouped_by_their_authorization_scope() {
+    func roundData(_ snaps: [String], _ id: String) -> Data {
+      let cands = snaps.enumerated().map {
+        ToTSelectionCandidate(id: "n\($0.offset)", branchIndex: $0.offset, snapshotName: $0.element)
+      }
+      return try! JSONEncoder().encode(
+        BestOfNRound(level: 1, candidates: cands, chosenID: nil, roundID: id))
+    }
+    let r1 = Message(role: "assistant", content: "", bestOfN: roundData(["a0", "a1"], "R1"))
+    let r2 = Message(role: "assistant", content: "", bestOfN: roundData(["b0"], "R2"))
+    let groups = BestOfNRound.uncommittedRounds(in: [r1, r2])
+    XCTAssertEqual(groups.count, 2, "one request per round, not one flat list")
+    XCTAssertEqual(groups[0].roundID, "R1")
+    XCTAssertEqual(groups[0].names, ["a0", "a1"])
+    XCTAssertEqual(groups[1].roundID, "R2")
+    XCTAssertEqual(groups[1].names, ["b0"])
+  }
+
+  /// A round persisted before `roundID` existed has no authorization scope, so
+  /// the guest would refuse every one of its names. It is omitted from the
+  /// sweep rather than issued and refused: the alternative — a guard loose
+  /// enough to accept it — would accept `bon/bon-0/...`, which is every round
+  /// of every chat. Those snapshots leak once and age out.
+  func test_rounds_without_a_scope_are_omitted_from_the_sweep() {
+    let cands = [ToTSelectionCandidate(id: "n0", branchIndex: 0, snapshotName: "bon/bon-0/1/0")]
+    let legacy = try! JSONEncoder().encode(
+      BestOfNRound(level: 1, candidates: cands, chosenID: nil))
+    let m = Message(role: "assistant", content: "", bestOfN: legacy)
+    XCTAssertTrue(BestOfNRound.uncommittedRounds(in: [m]).isEmpty)
+    XCTAssertTrue(BestOfNRound.uncommittedCandidateSnapshotNames(in: [m]).isEmpty)
   }
 
 
@@ -266,6 +322,7 @@ final class BestOfNTests: XCTestCase {
       persistenceStatus: PersistenceStatus(),
       options: ChatSendRequestOptions(modelID: "m"),
       resume: ChatSendController.BestOfNResume(
+        roundID: "ROUND-1",
         pickedName: "bon/r0/1/1",
         pickedText: "Use a phased launch.",
         selectedComment: "Emphasize launch risks and mitigations.",
@@ -281,6 +338,17 @@ final class BestOfNTests: XCTestCase {
     let req = try XCTUnwrap(engine.lastRequest, "think-more must dispatch a best-of-n request")
     XCTAssertEqual(req.inferlet, "best-of-n")
     let input = try JSONDecoder().decode(BestOfNResumeWire.self, from: req.input)
+    // A think-more CONTINUES its round, so `sendBestOfN` must forward the
+    // resume's scope rather than mint a fresh one. When it minted, the guest
+    // refused every `resume_from` as belonging to a different round and
+    // think-more failed with a hard 400 on every attempt.
+    //
+    // Asserted HERE, on the request the production builder actually produced,
+    // rather than on a `BestOfNRequestInput` a test assembled itself — the
+    // latter only proves JSONEncoder works and would stay green if
+    // `makeBestOfNRequest` stopped forwarding the scope. That is the same
+    // construct-your-own-input flaw as the bug it guards.
+    XCTAssertEqual(input.roundID, "ROUND-1")
     XCTAssertEqual(input.resumeFrom, "bon/r0/1/1")
     XCTAssertEqual(input.pickedText, "Use a phased launch.")
     XCTAssertEqual(input.selectedComment, "Emphasize launch risks and mitigations.")
@@ -317,6 +385,7 @@ final class BestOfNTests: XCTestCase {
       persistenceStatus: PersistenceStatus(),
       options: ChatSendRequestOptions(modelID: "m"),
       resume: ChatSendController.BestOfNResume(
+        roundID: "ROUND-1",
         pickedName: "bon/r0/1/1", pickedText: "Use a phased launch.",
         selectedComment: guidance, unpicked: ["bon/r0/1/0"], level: 2))
 
@@ -456,9 +525,16 @@ final class BestOfNTests: XCTestCase {
   private struct ReleaseWire: Decodable {
     let model: String
     let release: [String]
+    let roundID: String
+
+    private enum CodingKeys: String, CodingKey {
+      case model, release
+      case roundID = "round_id"
+    }
   }
 
   private struct BestOfNResumeWire: Decodable {
+    let roundID: String?
     let resumeFrom: String?
     let pickedText: String?
     let selectedComment: String?
@@ -466,6 +542,7 @@ final class BestOfNTests: XCTestCase {
     let level: Int?
 
     private enum CodingKeys: String, CodingKey {
+      case roundID = "round_id"
       case resumeFrom = "resume_from"
       case pickedText = "picked_text"
       case selectedComment = "selected_comment"

@@ -1,0 +1,13 @@
+[package]
+name = "ratio-names"
+version = "0.1.0"
+edition = "2024"
+description = "Durable snapshot-name registry and digest. Compiles for host AND wasm32-wasip2."
+
+# Same purity constraint as ratio-wire: both the gateway (host) and the
+# inferlets (wasm) depend on this, so nothing target-specific may appear.
+# `sha2` is used rather than blake3 because chat-apc already ships it on
+# wasm32-wasip2, so it is proven on this target.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"

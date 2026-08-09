@@ -1,0 +1,17 @@
+[package]
+name = "gen-core"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-independent chat generation: request semantics, prompt building, decode loop. Emits ratio-wire Events; knows nothing about HTTP."
+
+[dependencies]
+inferlet = { path = "../../Vendor/pie/sdk/rust/inferlet" }
+ratio-wire = { path = "../ratio-wire" }
+ratio-names = { path = "../ratio-names" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+
+# Host `cargo test --lib` works despite the SDK dependency: wit-bindgen's
+# extern declarations link fine as long as the tests never call them. Same
+# arrangement chat-apc already uses for `make test-inferlets`.

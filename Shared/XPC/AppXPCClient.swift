@@ -156,7 +156,7 @@ public enum HelperProtocolCompatibility {
   /// or an in-place upgrade leaves a running old helper that passes the
   /// reachability gate yet cannot service the new call (incl. a reply/status
   /// BYTE-format change like #476).
-  public static let currentVersion = 7
+  public static let currentVersion = 8
 
   public static func isCompatible(client: any AppXPCClient) async -> Bool {
     do {
@@ -597,6 +597,29 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
     }
   }
 
+  /// Shared reply handling for both start paths (with and without an explicit
+  /// backend). Contract (PieHelperXPC): exactly one of
+  /// (successData=EnginePort, errorData=EngineError) is non-nil. The port is
+  /// discarded — callers rely on the engine-status poll for the live
+  /// `.running` signal; this only needs to surface a refusal. A wire-contract
+  /// violation decodes to EngineError(.wireContractViolation).
+  private static func handleStartReply(
+    _ successData: Data?,
+    _ errorData: Data?,
+    _ resumeOnce: (Result<Void, Error>) -> Void
+  ) {
+    do {
+      switch try PieHelperXPCWire.decodeStartEngineReply(
+        successData: successData, errorData: errorData
+      ) {
+      case .success: resumeOnce(.success(()))
+      case .failure(let engineError): resumeOnce(.failure(engineError))
+      }
+    } catch {
+      resumeOnce(.failure(error))
+    }
+  }
+
   private func startEngine(profileID: String,
                            modelOverride: String?,
                            on connection: NSXPCConnection) async throws {
@@ -635,7 +658,13 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
         return
       }
-      api.startEngine(profileID: profileID, modelOverride: modelOverride) { successData, errorData in
+      // Resolve in the app; the helper's launchd environment is independent.
+      let backend = ChatBackend.fromEnvironment()
+      api.startEngineWithBackend(
+        profileID: profileID,
+        modelOverride: modelOverride,
+        chatBackend: backend.rawValue
+      ) { successData, errorData in
         // Contract (PieHelperXPC): exactly one of (successData=EnginePort,
         // errorData=EngineError) is non-nil. We discard the port — the
         // caller relies on the engine-status poll for the live `.running`

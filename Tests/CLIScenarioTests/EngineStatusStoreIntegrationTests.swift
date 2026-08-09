@@ -174,6 +174,13 @@ private final class FixedStatusExportedObject: NSObject, PieHelperXPC, @unchecke
                 reply: reply)
   }
 
+  func startEngineWithBackend(profileID: String,
+                              modelOverride: String?,
+                              chatBackend: String,
+                              reply: @escaping (Data?, Data?) -> Void) {
+    startEngine(profileID: profileID, modelOverride: modelOverride, reply: reply)
+  }
+
   func startEngine(profileID: String,
                    daemonBindHost: String,
                    reply: @escaping (Data?, Data?) -> Void) {
@@ -245,6 +252,11 @@ private final class NeverReplyStatusExportedObject: NSObject, PieHelperXPC, @unc
   func startEngine(profileID: String,
                    modelOverride: String?,
                    reply: @escaping (Data?, Data?) -> Void) {}
+
+  func startEngineWithBackend(profileID: String,
+                              modelOverride: String?,
+                              chatBackend: String,
+                              reply: @escaping (Data?, Data?) -> Void) {}
 
   func startEngine(profileID: String,
                    daemonBindHost: String,

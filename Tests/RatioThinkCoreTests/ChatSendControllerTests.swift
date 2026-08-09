@@ -149,7 +149,13 @@ final class ChatSendControllerTests: XCTestCase {
         sampling: ChatSampling(temperature: 0.2, topP: 0.8, maxTokens: 64),
         // #522: every send carries a per-chat prefix-cache directive
         // (system override + 1 user message → boundary turn 2).
-        cache: ChatCacheDirective(key: chat.id.uuidString, turn: 2)
+        cache: ChatCacheDirective(key: chat.id.uuidString, turn: 2),
+        // The mode-neutral KV boundary directive. Same key and turn as
+        // `cache`, because both are derived from the same conversation
+        // identity — but a separate field, since `cache` is chat-apc's
+        // per-inferlet APC directive and this one is what ToT and Best-of-N
+        // also carry so all three modes name the same `conv/` boundary.
+        boundary: ChatCacheDirective(key: chat.id.uuidString, turn: 2)
       )
     ])
     XCTAssertEqual(chat.messages.count, 2)
@@ -663,6 +669,56 @@ final class ChatSendControllerTests: XCTestCase {
     )
 
     controller.cancel()
+  }
+
+  func test_completed_reasoning_only_assistant_is_excluded_from_next_request() async throws {
+    let container = try RatioThinkModelContainer.makeInMemory()
+    let context = ModelContext(container)
+    let chat = Chat()
+    context.insert(chat)
+    chat.messages.append(Message(role: "user", content: "first", ts: Date(timeIntervalSinceReferenceDate: 1)))
+    try context.save()
+
+    let engine = ImmediateChatEngine(events: [
+      .reasoningDelta("thinking"),
+      .finish(reason: .length),
+    ])
+    let controller = ChatSendController()
+
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m1")
+    )
+    try await waitUntil("reasoning-only request finishes") { !controller.isInFlight }
+    let reasoningOnlyAssistant = try XCTUnwrap(assistantMessages(in: chat).first)
+    XCTAssertEqual(reasoningOnlyAssistant.content, "")
+    XCTAssertEqual(reasoningOnlyAssistant.reasoning, "thinking")
+    XCTAssertEqual(reasoningOnlyAssistant.finishReason, "length")
+
+    chat.messages.append(Message(role: "user", content: "second", ts: Date(timeIntervalSinceReferenceDate: 2)))
+    try context.save()
+    controller.send(
+      chat: chat,
+      context: context,
+      engine: engine,
+      modelLoadCenter: ModelLoadCenter(),
+      persistenceStatus: PersistenceStatus(),
+      options: ChatSendRequestOptions(modelID: "m2")
+    )
+    try await waitUntil("second request starts") { engine.requests.count == 2 }
+
+    XCTAssertEqual(
+      engine.requests[1].messages,
+      [
+        ChatMessage(role: .user, content: "first"),
+        ChatMessage(role: .user, content: "second"),
+      ],
+      "completed reasoning-only output is local UI state, not replayable prompt history"
+    )
   }
 
   func test_send_marksContextUsageRequestLocalActiveAndDestroyedOnFinish() async throws {

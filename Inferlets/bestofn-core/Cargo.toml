@@ -1,0 +1,18 @@
+[package]
+name = "bestofn-core"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-independent Best-of-N: rounds, validated resume, commit, guarded release."
+
+# Built on tot-core's `generate_branch`, the same primitive tree search uses.
+# chat-apc had the identical arrangement (its bestofn imported tot::branch), so
+# keeping it is the port, not a redesign.
+[dependencies]
+inferlet = { path = "../../Vendor/pie/sdk/rust/inferlet" }
+ratio-wire = { path = "../ratio-wire" }
+ratio-names = { path = "../ratio-names" }
+gen-core = { path = "../gen-core" }
+tot-core = { path = "../tot-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"

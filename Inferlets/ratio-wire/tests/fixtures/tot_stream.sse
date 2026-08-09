@@ -1,0 +1,78 @@
+data: {"event":"tree_start","id":"tot-0","model":"qwen","breadth":2,"depth":1,"beam_width":1}
+
+data: {"event":"node_start","id":"tot-n1","parent_id":"root","depth":1,"branch_index":0}
+
+data: {"event":"node_start","id":"tot-n2","parent_id":"root","depth":1,"branch_index":1}
+
+data: {"event":"node_delta","id":"tot-n1","kind":"answer","text":"One"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":"One"}
+
+data: {"event":"node_delta","id":"tot-n1","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" prime"}
+
+data: {"event":"node_delta","id":"tot-n1","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" number"}
+
+data: {"event":"node_delta","id":"tot-n1","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"tot-n1","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"tot-n1","kind":"answer","text":"7"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":"7"}
+
+data: {"event":"node_delta","id":"tot-n1","kind":"answer","text":"."}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":","}
+
+data: {"event":"node_scoring","id":"tot-n1"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" which"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" is"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" greater"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" than"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":" "}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":"5"}
+
+data: {"event":"node_delta","id":"tot-n2","kind":"answer","text":"."}
+
+data: {"event":"node_scoring","id":"tot-n2"}
+
+data: {"event":"node_complete","node":{"id":"tot-n1","parent_id":"root","depth":1,"branch_index":0,"content":"One prime number is 7.","score":7,"status":"ok"}}
+
+data: {"event":"node_complete","node":{"id":"tot-n2","parent_id":"root","depth":1,"branch_index":1,"content":"One prime number is 7, which is greater than 5.","score":5,"status":"ok"}}
+
+data: {"event":"level_pruned","level":1,"kept":["tot-n1"]}
+
+data: {"event":"final_delta","text":"One"}
+
+data: {"event":"final_delta","text":" prime"}
+
+data: {"event":"final_delta","text":" number"}
+
+data: {"event":"final_delta","text":" is"}
+
+data: {"event":"final_delta","text":" "}
+
+data: {"event":"final_delta","text":"7"}
+
+data: {"event":"final_delta","text":"."}
+
+data: {"event":"generation_metrics","output_tokens":283,"elapsed_s":14.017725042,"tokens_per_sec":20.188725285456343}
+
+data: {"event":"tree_complete","selected_node_id":"tot-n1","final_answer":"One prime number is 7.","synthesized":true}
+
+data: [DONE]
+

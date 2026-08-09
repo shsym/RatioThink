@@ -124,6 +124,16 @@ public protocol PieHelperXPC {
                    daemonBindHost: String,
                    reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
 
+  /// Backend-aware start (`ratio-gateway` vs the chat-apc daemon).
+  ///
+  /// `chatBackend` is `ChatBackend.rawValue` — only `String` traverses the
+  /// connection natively, so it crosses as one.
+  func startEngineWithBackend(
+    profileID: String,
+    modelOverride: String?,
+    chatBackend: String,
+    reply: @escaping (_ successData: Data?, _ errorData: Data?) -> Void)
+
   /// Strict active-profile rebuild. Same reply tuple as `startEngine`,
   /// but the helper owns real engine state: it waits for any live
   /// engine to reach helper-confirmed terminal stop before starting
