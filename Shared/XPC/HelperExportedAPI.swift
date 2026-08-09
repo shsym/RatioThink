@@ -114,6 +114,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   /// `EngineError(.profileMissing, …)` rather than synthesizing a
   /// bogus spec.
   private let launchSpecResolver: LaunchSpecResolver?
+  private let launchSpecBackendSetter: ((ChatBackend) -> Void)?
 
   /// Owns the `ModelDownloader` for this helper process. Wired in
   /// Phase 2.5. Eagerly constructed so the first `downloadModel`
@@ -151,6 +152,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   public override init() {
     self.engineHost = nil
     self.launchSpecResolver = nil
+    self.launchSpecBackendSetter = nil
     self.downloader = ModelDownloader()
     self.onQuitRequested = nil
     #if DEBUG
@@ -161,9 +163,11 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
 
   public init(engineHost: PieEngineHost? = nil,
               launchSpecResolver: LaunchSpecResolver? = nil,
+              launchSpecBackendSetter: ((ChatBackend) -> Void)? = nil,
               onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.engineHost = engineHost
     self.launchSpecResolver = launchSpecResolver
+    self.launchSpecBackendSetter = launchSpecBackendSetter
     self.downloader = ModelDownloader()
     self.onQuitRequested = onQuitRequested
     #if DEBUG
@@ -181,9 +185,11 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
   internal init(engineHost: PieEngineHost?,
                 launchSpecResolver: LaunchSpecResolver?,
                 replyTimeoutOverride: (start: TimeInterval, stop: TimeInterval)?,
+                launchSpecBackendSetter: ((ChatBackend) -> Void)? = nil,
                 onQuitRequested: (@Sendable () -> Void)? = nil) {
     self.engineHost = engineHost
     self.launchSpecResolver = launchSpecResolver
+    self.launchSpecBackendSetter = launchSpecBackendSetter
     self.downloader = ModelDownloader()
     self.onQuitRequested = onQuitRequested
     self.replyTimeoutOverride = replyTimeoutOverride
@@ -368,6 +374,7 @@ public final class HelperExportedAPI: NSObject, PieHelperXPC {
       reply(nil, Self.notImplementedErrorData)
       return
     }
+    launchSpecBackendSetter?(backend)
     // No explicit bind host on this path: the resolver injects the
     // file-backed persisted Local API bind mode into the spec, so a
     // model-pick start still inherits the user's exposure preference.

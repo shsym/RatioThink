@@ -141,7 +141,12 @@ public struct LaunchSpecResolver {
   /// `HelperExportedAPI`. Held here rather than passed through the spec-builder
   /// closure so that closure keeps its `(profileID, explicitModel)` shape and
   /// its existing test seams stay valid.
-  public var chatBackend: ChatBackend = .daemon
+  private let chatBackendState = OSAllocatedUnfairLock(initialState: ChatBackend.daemon)
+
+  public var chatBackend: ChatBackend {
+    get { chatBackendState.withLock { $0 } }
+    nonmutating set { chatBackendState.withLock { $0 = newValue } }
+  }
 
   public func resolveLauncherSpec(profileID: String,
                                   explicitModel: String? = nil,

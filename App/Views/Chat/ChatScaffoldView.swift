@@ -1061,7 +1061,7 @@ struct ChatScaffoldView: View {
           releaseSnapshots: {
             // Still gated on a durable save: a rejected commit must not discard
             // the recovery state.
-            if let prepared {
+            if ChatBackend.fromEnvironment() == .gateway, let prepared {
               sendCoordinator.controller(for: chatID)
                 .dispatchBestOfNCommit(prepared, engine: engineStore.client)
             } else {

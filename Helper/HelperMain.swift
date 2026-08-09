@@ -63,6 +63,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
   /// degraded mode or when neither production nor smoke wiring
   /// produced a resolver.
   private var launchSpecResolver: HelperExportedAPI.LaunchSpecResolver?
+  private var launchSpecBackendSetter: ((ChatBackend) -> Void)?
 
   /// Set by `eagerProbePieDirs` when the configured PIE_HOME cannot be
   /// created. Once true, the helper publishes an *error* status item
@@ -356,6 +357,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
       let resolver = buildLaunchSpecResolver()
       exported = HelperExportedAPI(engineHost: host,
                                    launchSpecResolver: resolver,
+                                   launchSpecBackendSetter: launchSpecBackendSetter,
                                    onQuitRequested: Self.terminateSelf)
       // Phase 2.3: wire engine-host state into the menu-bar dot
       // once a healthy host exists. Degraded boots skip this — the
@@ -1007,6 +1009,7 @@ final class HelperAppDelegate: NSObject, NSApplicationDelegate {
     )
     let closure = resolver.asClosure
     self.launchSpecResolver = closure
+    self.launchSpecBackendSetter = { resolver.chatBackend = $0 }
     Log.helper.info("buildLaunchSpecResolver: ProfileStore-backed resolver wired (profiles=\(profilesDir.path, privacy: .public))")
     return closure
   }
