@@ -246,11 +246,6 @@ public actor GatewaySupervisor {
 }
 
 /// Which backend serves `/v1/chat/completions`.
-///
-/// The A/B switch phase 5 exists to deliver: `RATIO_CHAT_BACKEND=gateway`
-/// routes the app through `ratio-gateway` + `chat.wasm`; anything else keeps
-/// the chat-apc daemon. Defaults to `daemon` so the flag is opt-in until the
-/// phase-6 flip.
 public enum ChatBackend: String, Sendable {
   case daemon
   case gateway

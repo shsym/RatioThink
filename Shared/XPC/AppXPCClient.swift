@@ -658,12 +658,7 @@ public final class HelperXPCClient: AppXPCClient, @unchecked Sendable {
         resumeOnce(.failure(AppXPCClientError.proxyTypeMismatch))
         return
       }
-      // The backend choice is resolved HERE, in the app process, and sent
-      // across. `ChatBackend.fromEnvironment()` in the helper would read the
-      // launchd environment — global, sticky, and not settable from an app-side
-      // `launchEnvironment`. Resolving it app-side is the whole point of
-      // carrying it over XPC.
-      //
+      // Resolve in the app; the helper's launchd environment is independent.
       let backend = ChatBackend.fromEnvironment()
       api.startEngineWithBackend(
         profileID: profileID,

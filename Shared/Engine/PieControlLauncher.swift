@@ -859,19 +859,8 @@ public enum PieControlLauncher {
                                         manifestURL: spec.manifestURL,
                                         forceOverwrite: true)
       }
-      // pass port 0 so pie's inferlet daemon binds an OS-assigned free
-      // port at bind time, then learn the actual port from pie's own "Daemon
-      // serving HTTP on …" log line. This eliminates the old
-      // reserve-bind-close-reuse TOCTOU in `reserveFreePort()`: an App-chosen
-      // port could be stolen in the window between our `close()` and pie's
-      // later `bind()`. With the OS choosing at bind time the port cannot be
-      // stolen, and nobody but pie knows it until it is already bound.
-      //
-      // build-9 fix: that line is `tracing::info!` → it lands ONLY in
-      // <pieHome>/logs/pie.log, NEVER on the captured stdout (build-8 watched
-      // stdout and hung 30s every launch). Snapshot the log cursor BEFORE
-      // launch_daemon so the post-launch scan can't pick up a stale port from
-      // an earlier same-day launch sharing the rolling daily file.
+      // PIE binds port 0 atomically. Capture the log cursor first so port
+      // discovery cannot reuse an older launch's entry.
       if backend == .daemon {
         let logCursor = PieControlLauncher.daemonLogCursor(pieHome: spec.pieHome)
         try await client.launchDaemon(
@@ -917,19 +906,8 @@ public enum PieControlLauncher {
       throw LaunchError.clientError(underlying: "\(error)")
     }
 
-    // A/B switch (phase 5). With RATIO_CHAT_BACKEND=gateway the app must talk
-    // to ratio-gateway, NOT the chat-apc daemon — and because
-    // `HTTPEngineClient` resolves its base URL from `EngineStatus.running(port:)`
-    // (which PieEngineHost publishes from whatever this function returns),
-    // redirecting the app means returning the GATEWAY's port here. Rewriting
-    // <PIE_HOME>/http.port alone would only move test harnesses.
-    //
-    // Default is `.daemon`, so with the flag unset this whole block is skipped
-    // and the launch path is byte-identical to before.
     if backend == .gateway {
-      // NOT Bundle.main: in production this runs inside RationalHelper.app,
-      // while the gateway is staged in the containing Rational.app. The
-      // nested-bundle walk is the same one chat-apc's wasm already uses.
+      // The helper is nested inside Rational.app, where gateway assets live.
       let supervisor = GatewaySupervisor()
       do {
         let staged = try InferletResources.gateway()
