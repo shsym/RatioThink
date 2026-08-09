@@ -199,13 +199,20 @@ fn parse_entry(wasm: &Path, manifest: &Path) -> Result<Entry> {
         .and_then(|v| v.as_str())
         .unwrap_or(name)
         .to_string();
-    let protocol = Protocol::parse(
-        ratio
-            .and_then(|r| r.get("protocol"))
+    let protocol_name = match ratio {
+        Some(ratio) => ratio
+            .get("protocol")
             .and_then(|v| v.as_str())
-            .unwrap_or("chat-v1"),
-    )
-    .with_context(|| format!("in {}", manifest.display()))?;
+            .with_context(|| {
+                format!(
+                    "{} has no [ratio].protocol (known: chat-v1, tree-v1, json-unary-v1)",
+                    manifest.display()
+                )
+            })?,
+        None => "chat-v1",
+    };
+    let protocol =
+        Protocol::parse(protocol_name).with_context(|| format!("in {}", manifest.display()))?;
     let preload = ratio
         .and_then(|r| r.get("preload"))
         .and_then(|v| v.as_bool())
@@ -349,8 +356,18 @@ preload = true
     #[test]
     fn duplicate_route_is_rejected() {
         let d = tmp();
-        write(&d, "a", b"\0asm", "[package]\nname=\"a\"\nversion=\"1\"\n[ratio]\nroute=\"same\"\n");
-        write(&d, "b", b"\0asm", "[package]\nname=\"b\"\nversion=\"1\"\n[ratio]\nroute=\"same\"\n");
+        write(
+            &d,
+            "a",
+            b"\0asm",
+            "[package]\nname=\"a\"\nversion=\"1\"\n[ratio]\nroute=\"same\"\nprotocol=\"chat-v1\"\n",
+        );
+        write(
+            &d,
+            "b",
+            b"\0asm",
+            "[package]\nname=\"b\"\nversion=\"1\"\n[ratio]\nroute=\"same\"\nprotocol=\"chat-v1\"\n",
+        );
         let err = Registry::scan(&d).unwrap_err().to_string();
         assert!(err.contains("duplicate route"), "got: {err}");
     }
@@ -358,8 +375,18 @@ preload = true
     #[test]
     fn duplicate_program_id_is_rejected() {
         let d = tmp();
-        write(&d, "a", b"\0asm", "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nroute=\"a\"\n");
-        write(&d, "b", b"\0asm", "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nroute=\"b\"\n");
+        write(
+            &d,
+            "a",
+            b"\0asm",
+            "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nroute=\"a\"\nprotocol=\"chat-v1\"\n",
+        );
+        write(
+            &d,
+            "b",
+            b"\0asm",
+            "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\nroute=\"b\"\nprotocol=\"chat-v1\"\n",
+        );
         let err = Registry::scan(&d).unwrap_err().to_string();
         assert!(err.contains("duplicate program id"), "got: {err}");
     }
@@ -380,6 +407,24 @@ preload = true
         let err = format!("{:#}", Registry::scan(&d).unwrap_err());
         assert!(err.contains("unknown protocol"), "got: {err}");
         assert!(err.contains("x.Pie.toml"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_protocol_is_rejected_rather_than_defaulted() {
+        let d = tmp();
+        write(
+            &d,
+            "x",
+            b"\0asm",
+            "[package]\nname=\"x\"\nversion=\"1\"\n[ratio]\n",
+        );
+        let err = format!("{:#}", Registry::scan(&d).unwrap_err());
+        assert!(err.contains("has no [ratio].protocol"), "got: {err}");
+        assert!(err.contains("x.Pie.toml"), "got: {err}");
+        assert!(
+            err.contains("chat-v1, tree-v1, json-unary-v1"),
+            "got: {err}"
+        );
     }
 
     /// Validation must not partially apply — the caller keeps the old registry.
@@ -427,7 +472,7 @@ preload = true
             &d,
             "chat",
             b"\0asm",
-            "[package]\nname=\"chat\"\nversion=\"0.1.0\"\n[ratio]\naliases=[\"chat-apc\"]\n",
+            "[package]\nname=\"chat\"\nversion=\"0.1.0\"\n[ratio]\naliases=[\"chat-apc\"]\nprotocol=\"chat-v1\"\n",
         );
         let r = Registry::scan(&d).unwrap();
         assert_eq!(r.get("chat").unwrap().program, r.get("chat-apc").unwrap().program);
@@ -443,7 +488,7 @@ preload = true
             &d,
             "chat",
             b"\0asm2",
-            "[package]\nname=\"chat\"\nversion=\"1\"\n[ratio]\naliases=[\"echo\"]\n",
+            "[package]\nname=\"chat\"\nversion=\"1\"\n[ratio]\naliases=[\"echo\"]\nprotocol=\"chat-v1\"\n",
         );
         let err = Registry::scan(&d).unwrap_err().to_string();
         assert!(err.contains("duplicate route"), "got: {err}");
