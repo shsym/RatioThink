@@ -1,5 +1,3 @@
-# Transport-conformance engine config (phase 1).
-#
 # Uses the dummy driver: no weights are loaded and no compute runs, so process
 # launch is fast enough to stress the launch/emit/cancel path thousands of
 # times. `hf_repo` must still resolve to a snapshot carrying a tokenizer —

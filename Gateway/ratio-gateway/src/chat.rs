@@ -5,11 +5,11 @@
 //! `gen-core` owns request semantics.
 
 use crate::routes::AppState;
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use pie_client::client::{Client, Process, ProcessEvent};
 use ratio_wire::{Event, GenResult, OpenAiSse, RunInput, SeqChecker};
 use serde_json::json;
@@ -52,7 +52,8 @@ pub fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
     // The app's retry ladder keys on Retry-After for over-capacity; without it
     // a 503 is treated as a hard failure instead of a backoff.
     if status == StatusCode::SERVICE_UNAVAILABLE {
-        resp.headers_mut().insert("Retry-After", axum::http::HeaderValue::from_static("1"));
+        resp.headers_mut()
+            .insert("Retry-After", axum::http::HeaderValue::from_static("1"));
     }
     resp
 }
@@ -79,22 +80,18 @@ pub async fn chat_completions(
 ) -> Response {
     // ---- pre-commit ----
     if body.len() > CHAT_MAX_BODY {
-        return api_error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", "body too large");
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "body too large",
+        );
     }
     let raw: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, "invalid_request", &e.to_string()),
     };
 
-    // §2: a dispatch-shaped request (`inferlet:` naming tree-of-thought or
-    // best-of-n) is NOT an ordinary chat request. Without routing on this field
-    // it would deserialize as a plain ChatRequest, silently drop the advanced
-    // envelope, and answer as if the profile had never been selected — a wrong
-    // answer, not an error.
-    //
-    // The registry decides what that name means. `chat-apc` from the shipped
-    // app reaches `chat` through a manifest alias rather than a string compare
-    // here, so the gateway has no per-inferlet knowledge to update.
+    // Resolve the protocol class before decoding protocol-specific fields.
     let route = raw
         .get("inferlet")
         .and_then(|v| v.as_str())
@@ -105,24 +102,7 @@ pub async fn chat_completions(
         Err(resp) => return resp,
     };
 
-    // DISPATCH BY PROTOCOL CLASS, before reading a single chat-specific field.
-    //
-    // The app posts streaming ToT and Best-of-N here, not to /v1/inferlet
-    // (`HTTPEngineClient.dispatchInferlet:193-196`), so this endpoint receives
-    // tree routes and must hand them to the tree driver. Without it, `prepare`
-    // resolves the route, the chat driver takes over, and its deferred-commit
-    // loop waits for an `Event::Ready` a tree guest never sends — so the guest
-    // runs an ENTIRE search, returns, and the driver reports
-    // "returned before ready" as a 500. Measured at 14s of wasted generation
-    // per request.
-    //
-    // This was masked until `TreeV1::implemented()` became true: before that,
-    // `prepare` refused tree routes here with an honest 501. Making the tree
-    // driver real is what opened the path, and no gate caught it because every
-    // gate posted to /v1/inferlet — the endpoint the app does NOT use for these.
-    //
-    // With both endpoints dispatching by class, which URL a caller picks stops
-    // being able to change behaviour.
+    // Both app-facing endpoints dispatch by protocol class.
     match entry.protocol {
         crate::registry::Protocol::ChatV1 => {}
         crate::registry::Protocol::TreeV1 => {
@@ -140,7 +120,11 @@ pub async fn chat_completions(
 
     // Only routing/transport fields are read here. Everything else — roles,
     // sampling bounds, cue mode — belongs to gen-core.
-    let model = raw.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let model = raw
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
     let stream = raw.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let include_usage = raw
         .get("stream_options")
@@ -162,13 +146,23 @@ pub async fn chat_completions(
     };
     let input = match serde_json::to_string(&run_input) {
         Ok(s) => s,
-        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_failed", &e.to_string()),
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encode_failed",
+                &e.to_string(),
+            );
+        }
     };
 
     let client = match st.engine.request_client().await {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            return api_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", &e.to_string());
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine_unavailable",
+                &e.to_string(),
+            );
         }
     };
     let mut proc = match client
@@ -188,22 +182,38 @@ pub async fn chat_completions(
         match timeout(st.first_event_timeout, proc.recv()).await {
             Err(_) => {
                 let _ = client.terminate_process(proc.id()).await;
-                return api_error(StatusCode::GATEWAY_TIMEOUT, "inferlet_start_timeout", "no ready");
+                return api_error(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "inferlet_start_timeout",
+                    "no ready",
+                );
             }
             Ok(Err(e)) => {
-                return api_error(StatusCode::BAD_GATEWAY, "engine_stream_closed", &e.to_string());
+                return api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "engine_stream_closed",
+                    &e.to_string(),
+                );
             }
             Ok(Ok(ProcessEvent::Error(e))) => {
                 return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
             }
             Ok(Ok(ProcessEvent::Return(_))) => {
-                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "no_output", "returned before ready");
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "no_output",
+                    "returned before ready",
+                );
             }
             Ok(Ok(ProcessEvent::Message(m))) => {
                 let env = match seq.accept(&m) {
                     Ok(e) => e,
                     Err(pe) => {
-                        return api_error(StatusCode::BAD_GATEWAY, "protocol_error", &pe.to_string());
+                        return api_error(
+                            StatusCode::BAD_GATEWAY,
+                            "protocol_error",
+                            &pe.to_string(),
+                        );
                     }
                 };
                 match env.decode_event() {
@@ -224,8 +234,18 @@ pub async fn chat_completions(
     }
 
     if stream {
-        stream_response(st, client, proc, seq, pre_warnings, request_id, model, created,
-                        include_usage, started)
+        stream_response(
+            st,
+            client,
+            proc,
+            seq,
+            pre_warnings,
+            request_id,
+            model,
+            created,
+            include_usage,
+            started,
+        )
     } else {
         buffered_response(client, proc, seq, request_id, model, created, started).await
     }
@@ -246,7 +266,15 @@ fn stream_response(
 ) -> Response {
     let (tx, mut rx) = mpsc::channel::<Frame>(256);
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    tokio::spawn(drive(proc, Arc::clone(&client), tx, cancel_rx, seq, st.cancel_grace, started));
+    tokio::spawn(drive(
+        proc,
+        Arc::clone(&client),
+        tx,
+        cancel_rx,
+        seq,
+        st.cancel_grace,
+        started,
+    ));
 
     let guard = crate::routes::CancelOnDrop(Some(cancel_tx));
     let mut r = OpenAiSse::new(id, model, created).with_usage_chunk(include_usage);
@@ -392,16 +420,8 @@ async fn buffered_response(
 /// Owns the `Process`. Forwards events, and guarantees exactly one terminal
 /// sequence no matter how the stream ends.
 ///
-/// Three failure properties this must hold (all were broken before):
-///   1. A full downstream channel must NOT block the cancellation branch.
-///      `tx.send().await` inside the select arm parked the driver so it could
-///      no longer observe cancel, while pie kept buffering upstream.
-///   2. Every exit path terminates the process. Dropping the client only
-///      DETACHES it (`server.rs:400-403`), so a lost receiver used to leak a
-///      running generation.
-///   3. A post-commit fault must surface as an in-band `error` frame plus a
-///      synthesized `finish`, never as a clean truncated stream. Generic
-///      OpenAI clients have no `missing_finish_reason` fallback.
+/// Backpressure remains cancellation-safe, every exit terminates the process,
+/// and post-commit faults produce exactly one in-band terminal sequence.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     mut proc: Process,
@@ -441,7 +461,11 @@ async fn drive(
         match ev {
             Ok(ProcessEvent::Message(m)) => match seq.accept(&m) {
                 Ok(env) => match env.decode_event() {
-                    Ok(Some(Event::Usage { prompt_tokens, completion_tokens, context_window })) => {
+                    Ok(Some(Event::Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        context_window,
+                    })) => {
                         usage = Some(ratio_wire::UsageCounts {
                             prompt_tokens,
                             completion_tokens,
@@ -492,9 +516,14 @@ async fn drive(
         while Instant::now() < deadline {
             match timeout(deadline - Instant::now(), proc.recv()).await {
                 Ok(Ok(ProcessEvent::Message(m))) => {
-                    if m.contains(r#""t":"finish""#) { guest_stopped = true; }
+                    if m.contains(r#""t":"finish""#) {
+                        guest_stopped = true;
+                    }
                 }
-                Ok(Ok(ProcessEvent::Return(_))) => { guest_stopped = true; break }
+                Ok(Ok(ProcessEvent::Return(_))) => {
+                    guest_stopped = true;
+                    break;
+                }
                 Ok(Ok(ProcessEvent::Error(_))) => break,
                 Ok(Ok(_)) => continue,
                 _ => break,
@@ -532,5 +561,12 @@ async fn drive(
         output_tokens: u.completion_tokens,
         elapsed_s: started.elapsed().as_secs_f64(),
     });
-    let _ = tx.send(Frame::Terminal { reason, usage, metrics, error }).await;
+    let _ = tx
+        .send(Frame::Terminal {
+            reason,
+            usage,
+            metrics,
+            error,
+        })
+        .await;
 }

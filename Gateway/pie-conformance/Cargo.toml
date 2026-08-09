@@ -2,7 +2,7 @@
 name = "pie-conformance"
 version = "0.1.0"
 edition = "2024"
-description = "Phase-1 gate: proves PIE's process transport does not lose events and honors cancellation."
+description = "Checks PIE process event delivery and cooperative cancellation."
 
 [[bin]]
 name = "pie-conformance"

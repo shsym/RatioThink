@@ -1,11 +1,5 @@
 //! The `tree-v1` protocol class.
 //!
-//! The migration plan originally claimed a new inferlet would need "no gateway
-//! code". That was false, and this file is the proof: a tree stream differs
-//! from a chat stream in almost every structural decision the chat driver
-//! hardcodes. Read off the captured stream
-//! (`Inferlets/ratio-wire/tests/fixtures/tot_stream.sse`, 39 frames):
-//!
 //! | | chat-v1 | tree-v1 |
 //! |---|---|---|
 //! | commits on | `Event::Ready` | the first tree event |
@@ -16,28 +10,15 @@
 //! | `usage` frame | yes | never |
 //! | `generation_metrics` | in `terminal()` | inline, mid-stream |
 //!
-//! Two of those are silent failures rather than loud ones, which is why they
-//! are called out here:
-//!
-//! * **A tree stream contains no `Ready`.** Pointing the chat driver at a tree
-//!   inferlet does not error — it blocks until `first_event_timeout` and then
-//!   504s, because the deferred-commit loop breaks only on `Ready`.
-//! * **`terminal()` unconditionally emits an OpenAI finish chunk**
-//!   (`render.rs:352`). No tree capture contains one, so calling it appends a
-//!   frame that is not in the protocol. This driver never calls it.
-//!
-//! What tree-v1 does NOT need is a new renderer: `OpenAiSse` already renders
-//! every tree variant, because the `Event` vocabulary was declared in full
-//! (including the tree events no producer emitted yet) before ToT was ported.
-//! That was the anti-rewrite lever and it paid off.
+//! The tree driver owns terminal-event semantics; `OpenAiSse` owns framing.
 
 use crate::chat::{api_error, status_for};
-use ratio_wire::RunInput;
 use crate::routes::{AppState, CancelOnDrop};
 use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use pie_client::client::{Client, Process, ProcessEvent};
+use ratio_wire::RunInput;
 use ratio_wire::{Event, OpenAiSse, SeqChecker};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -62,7 +43,10 @@ enum Frame {
 /// Milestone C produces it; recognizing it here now means C adds a producer,
 /// not a protocol change.
 fn is_terminal(ev: &Event) -> bool {
-    matches!(ev, Event::TreeComplete { .. } | Event::AwaitingSelection { .. })
+    matches!(
+        ev,
+        Event::TreeComplete { .. } | Event::AwaitingSelection { .. }
+    )
 }
 
 /// Whether this tree-v1 request is a CONTROL op rather than a generative one.
@@ -129,17 +113,28 @@ pub async fn dispatch(
     }) {
         Ok(s) => s,
         Err(e) => {
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "encode_failed", &e.to_string());
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "encode_failed",
+                &e.to_string(),
+            );
         }
     };
 
     let client = match st.engine.request_client().await {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            return api_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", &e.to_string());
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "engine_unavailable",
+                &e.to_string(),
+            );
         }
     };
-    let mut proc = match client.launch_process(entry_program, input, true, None).await {
+    let mut proc = match client
+        .launch_process(entry_program, input, true, None)
+        .await
+    {
         Ok(p) => p,
         Err(e) => return api_error(StatusCode::BAD_GATEWAY, "launch_failed", &e.to_string()),
     };
@@ -171,7 +166,11 @@ pub async fn dispatch(
                 );
             }
             Ok(Err(e)) => {
-                return api_error(StatusCode::BAD_GATEWAY, "engine_stream_closed", &e.to_string());
+                return api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "engine_stream_closed",
+                    &e.to_string(),
+                );
             }
             Ok(Ok(ProcessEvent::Error(e))) => {
                 return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
@@ -199,7 +198,11 @@ pub async fn dispatch(
                     // is carried through: the ToT validators produce
                     // `param: "top_p"` and friends, and dropping it here would
                     // make every 400 anonymous.
-                    Ok(Some(Event::Error { code, message, param })) => {
+                    Ok(Some(Event::Error {
+                        code,
+                        message,
+                        param,
+                    })) => {
                         let _ = client.terminate_process(proc.id()).await;
                         return api_error_param(
                             status_for(&code),
@@ -221,7 +224,15 @@ pub async fn dispatch(
     // ---- committed ----
     let (tx, mut rx) = mpsc::channel::<Frame>(256);
     let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-    tokio::spawn(drive(proc, Arc::clone(&client), tx, cancel_rx, seq, st.cancel_grace, route));
+    tokio::spawn(drive(
+        proc,
+        Arc::clone(&client),
+        tx,
+        cancel_rx,
+        seq,
+        st.cancel_grace,
+        route,
+    ));
 
     let guard = CancelOnDrop(Some(cancel_tx));
     // `with_tree_metrics(true)` is mandatory. Without it the guest's
@@ -257,22 +268,24 @@ pub async fn dispatch(
         yield Ok(SseEvent::default().data("[DONE]"));
     };
 
-    tracing::debug!(elapsed_ms = started.elapsed().as_millis() as u64, "tree committed");
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "tree committed"
+    );
     Sse::new(stream).into_response()
 }
 
 /// Like `api_error` but carries `param`, which the ToT validators populate for
 /// every bounds rejection (`breadth`, `depth`, `top_p`, `exec`, …).
-fn api_error_param(
-    status: StatusCode,
-    code: &str,
-    message: &str,
-    param: Option<&str>,
-) -> Response {
+fn api_error_param(status: StatusCode, code: &str, message: &str, param: Option<&str>) -> Response {
     let mut resp = api_error(status, code, message);
     if let Some(p) = param {
         // Rebuild rather than patch: the body is already serialized.
-        let kind = if status.is_client_error() { "invalid_request_error" } else { "server_error" };
+        let kind = if status.is_client_error() {
+            "invalid_request_error"
+        } else {
+            "server_error"
+        };
         resp = (
             status,
             axum::Json(serde_json::json!({
@@ -429,9 +442,7 @@ mod tests {
         }));
     }
 
-    /// Best-of-N ends without a `tree_complete` at all — it hands the client a
-    /// pick set and stops. Recognizing it now is what keeps milestone C a
-    /// producer change rather than a protocol change.
+    /// `AwaitingSelection` terminates an interactive Best-of-N round.
     #[test]
     fn awaiting_selection_is_terminal() {
         assert!(is_terminal(&Event::AwaitingSelection {
@@ -446,8 +457,15 @@ mod tests {
 
     #[test]
     fn mid_stream_events_are_not_terminal() {
-        assert!(!is_terminal(&Event::TreeStart { breadth: 2, depth: 1, beam_width: 1 }));
-        assert!(!is_terminal(&Event::LevelPruned { level: 1, kept: vec!["tot-n1".into()] }));
+        assert!(!is_terminal(&Event::TreeStart {
+            breadth: 2,
+            depth: 1,
+            beam_width: 1
+        }));
+        assert!(!is_terminal(&Event::LevelPruned {
+            level: 1,
+            kept: vec!["tot-n1".into()]
+        }));
         assert!(!is_terminal(&Event::FinalDelta { text: "7".into() }));
         // GenerationMetrics precedes tree_complete in the capture, so treating
         // it as terminal would truncate the stream one frame early.
@@ -458,13 +476,16 @@ mod tests {
         }));
     }
 
-    /// The whole point of the class: a tree stream must never carry chat's
-    /// opening or closing frames.
+    /// Tree rendering must not add chat opening or closing frames.
     #[test]
     fn the_tree_renderer_emits_no_chat_chunks() {
         let mut r = OpenAiSse::new("tot-0", "qwen", 0).with_tree_metrics(true);
         let frames: Vec<String> = [
-            Event::TreeStart { breadth: 2, depth: 1, beam_width: 1 },
+            Event::TreeStart {
+                breadth: 2,
+                depth: 1,
+                beam_width: 1,
+            },
             Event::NodeStart {
                 id: "tot-n1".into(),
                 parent_id: "root".into(),
@@ -488,13 +509,19 @@ mod tests {
 
         assert_eq!(frames.len(), 4, "each tree event renders exactly one frame");
         for f in &frames {
-            assert!(!f.contains("chat.completion.chunk"), "chat chunk leaked into a tree stream: {f}");
+            assert!(
+                !f.contains("chat.completion.chunk"),
+                "chat chunk leaked into a tree stream: {f}"
+            );
             assert!(!f.contains("finish_reason"), "finish_reason leaked: {f}");
         }
-        assert!(frames[2].contains(r#""tokens_per_sec":20.188725285456343"#), "got {}", frames[2]);
+        assert!(
+            frames[2].contains(r#""tokens_per_sec":20.188725285456343"#),
+            "got {}",
+            frames[2]
+        );
     }
 }
-
 
 fn seq_start() -> SeqChecker {
     SeqChecker::default()
@@ -522,7 +549,11 @@ async fn unary_response(
                 );
             }
             Ok(Err(e)) => {
-                return api_error(StatusCode::BAD_GATEWAY, "engine_stream_closed", &e.to_string());
+                return api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "engine_stream_closed",
+                    &e.to_string(),
+                );
             }
             Ok(Ok(ProcessEvent::Error(e))) => {
                 return api_error(StatusCode::BAD_GATEWAY, "inferlet_error", &e);
@@ -534,7 +565,12 @@ async fn unary_response(
                 // makes an authorization refusal indistinguishable from a
                 // generic 400.
                 if let Ok(env) = seq.accept(&m) {
-                    if let Ok(Some(Event::Error { code, message, param })) = env.decode_event() {
+                    if let Ok(Some(Event::Error {
+                        code,
+                        message,
+                        param,
+                    })) = env.decode_event()
+                    {
                         let _ = client.terminate_process(proc.id()).await;
                         return api_error_param(
                             status_for(&code),
@@ -576,13 +612,17 @@ mod control_tests {
 
     #[test]
     fn a_commit_is_a_control_op() {
-        assert!(is_control_op(&json!({"input": {"commit": {"answer": "x"}}})));
+        assert!(is_control_op(
+            &json!({"input": {"commit": {"answer": "x"}}})
+        ));
         assert!(is_control_op(&json!({"commit": {"answer": "x"}})));
     }
 
     #[test]
     fn a_non_empty_release_is_a_control_op() {
-        assert!(is_control_op(&json!({"input": {"release": ["bon/a/1/0/b"]}})));
+        assert!(is_control_op(
+            &json!({"input": {"release": ["bon/a/1/0/b"]}})
+        ));
     }
 
     /// An EMPTY release list is not a control op — it would delete nothing and

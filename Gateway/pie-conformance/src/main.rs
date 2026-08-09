@@ -1,17 +1,7 @@
-//! Phase-1 transport conformance gate (doc/chat-refactor.md §11, §12 L0).
+//! PIE transport conformance.
 //!
-//! Two properties must hold before any chat porting begins:
-//!
-//!   A. NO EVENT LOSS. `handler.rs:471` spawns the process before the launch
-//!      response is sent; `client.rs:441` awaits that response and only then
-//!      (`:451-452`) registers the event channel; `client.rs:604` drops events
-//!      for an unregistered process id with no else branch. Events emitted in
-//!      that window vanish. This binary measures it.
-//!
-//!   B. COOPERATIVE CANCELLATION. `Process::signal` must reach the guest in
-//!      time for it to emit its own terminal frame, before `terminate_process`.
-//!
-//! Exit code 0 iff both hold.
+//! Verifies launch-event delivery under concurrency and bounded cooperative
+//! cancellation before authoritative termination.
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -45,33 +35,26 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     grace_ms: u64,
     /// Simultaneous in-flight launches per batch. 1 = sequential.
-    /// The race window (§2.5) is a scheduling window between the launch
-    /// response resolving and the event channel being registered, so a
-    /// contended runtime is where it would surface.
     #[arg(long, default_value_t = 1)]
     concurrency: u32,
 }
 
-/// Drain one process to termination. Returns (messages_seen, saw_return).
-async fn drain(proc: &mut Process) -> Result<(Vec<String>, bool)> {
+/// Drain one process to termination.
+async fn drain(proc: &mut Process) -> Result<Vec<String>> {
     let mut msgs = Vec::new();
-    let mut saw_return = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(30), proc.recv()).await {
             Err(_) => return Err(anyhow!("timed out waiting for events")),
             Ok(Err(e)) => return Err(anyhow!("recv failed: {e}")),
             Ok(Ok(ev)) => match ev {
                 ProcessEvent::Message(s) => msgs.push(s),
-                ProcessEvent::Return(_) => {
-                    saw_return = true;
-                    break;
-                }
+                ProcessEvent::Return(_) => break,
                 ProcessEvent::Error(e) => return Err(anyhow!("process error: {e}")),
                 _ => {}
             },
         }
     }
-    Ok((msgs, saw_return))
+    Ok(msgs)
 }
 
 /// Property A: launch → emit → drain, N times, counting lost events.
@@ -81,7 +64,6 @@ async fn test_no_loss(args: &Args, client: &Client) -> Result<bool> {
 
     let mut lossy_runs = 0u32;
     let mut lost_events = 0u32;
-    let mut missing_return = 0u32;
     let mut worst = expected;
     let started = Instant::now();
 
@@ -101,20 +83,20 @@ async fn test_no_loss(args: &Args, client: &Client) -> Result<bool> {
             );
         }
         for mut proc in procs {
-            let (msgs, saw_return) = drain(&mut proc).await?;
+            let msgs = drain(&mut proc).await?;
             let seen = msgs.len() as u32;
             if seen < expected {
                 lossy_runs += 1;
                 lost_events += expected - seen;
                 worst = worst.min(seen);
             }
-            if !saw_return {
-                missing_return += 1;
-            }
         }
         done += batch;
         if done % 500 == 0 || done == args.iterations {
-            println!("  … {}/{} runs, {} lossy so far", done, args.iterations, lossy_runs);
+            println!(
+                "  … {}/{} runs, {} lossy so far",
+                done, args.iterations, lossy_runs
+            );
         }
     }
 
@@ -128,12 +110,11 @@ async fn test_no_loss(args: &Args, client: &Client) -> Result<bool> {
     println!("    expected {expected} events per run");
     println!("    lossy runs      : {lossy_runs} / {}", args.iterations);
     println!("    events lost     : {lost_events}");
-    println!("    missing `return`: {missing_return}");
     if lossy_runs > 0 {
         println!("    worst run saw   : {worst} / {expected}");
     }
 
-    let pass = lossy_runs == 0 && missing_return == 0;
+    let pass = lossy_runs == 0;
     println!("    => {}", if pass { "PASS" } else { "FAIL" });
     Ok(pass)
 }
@@ -210,7 +191,7 @@ async fn main() -> Result<()> {
     let b = test_cancellation(&args, &client).await?;
 
     println!(
-        "\n=== phase-1 gate: {} ===",
+        "\n=== transport conformance: {} ===",
         if a && b { "PASS" } else { "FAIL" }
     );
     // `Client::close()` does not return here — it awaits a shutdown the reader
