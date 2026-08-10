@@ -1470,13 +1470,9 @@ public actor LaunchedSession {
     if !process.isRunning {
       return .gone(reason: "engine process exited (\(terminationDescription()))")
     }
-    // Third signal: in gateway mode the port the app is pinned to belongs to
-    // ratio-gateway, not pie. A dead gateway with a healthy engine used to
-    // leave EngineStatus `.running` against a dead port forever, because
-    // nothing probed it after startup. Checked BEFORE the engine ping: if the
-    // gateway is gone the app cannot reach anything, so the engine's health is
-    // moot and the restart ladder should fire on the real cause.
-    if let gateway, let reason = await gateway.recoverIfNeeded() {
+    // The app's published port belongs to the gateway, so report its failure
+    // before probing PIE. PieEngineHost then restarts the complete session.
+    if let gateway, let reason = await gateway.health() {
       return .gone(reason: reason)
     }
     guard let controlWSURL else {

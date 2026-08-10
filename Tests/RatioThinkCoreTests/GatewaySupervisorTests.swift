@@ -44,40 +44,32 @@ final class GatewaySupervisorTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: portFile.path))
   }
 
-  func test_crashRecoversOnPublishedPort() async throws {
+  func test_crashReportsGatewayFailure() async throws {
     let fixture = try fixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     let supervisor = GatewaySupervisor()
-    let port = try await supervisor.start(spec: fixture.spec())
+    _ = try await supervisor.start(spec: fixture.spec())
     let discoveredPID = await supervisor.processIdentifierForTesting()
     let firstPID = try XCTUnwrap(discoveredPID)
     XCTAssertEqual(kill(firstPID, SIGKILL), 0)
 
-    let recoveryFailure = await supervisor.recoverIfNeeded()
     let healthFailure = await supervisor.health()
-    let recoveredPID = await supervisor.processIdentifierForTesting()
-    XCTAssertNil(recoveryFailure)
-    XCTAssertNil(healthFailure)
-    XCTAssertNotEqual(recoveredPID, firstPID)
-    let body = try await URLSession.shared.data(
-      from: URL(string: "http://127.0.0.1:\(port)/healthz")!).0
-    XCTAssertEqual(String(decoding: body, as: UTF8.self), "ok")
+    let finalPID = await supervisor.processIdentifierForTesting()
+    XCTAssertTrue(healthFailure?.hasPrefix("gateway ") == true)
+    XCTAssertEqual(finalPID, firstPID)
     let shutdownResult = await supervisor.shutdown(reason: "test")
     XCTAssertTrue(shutdownResult.reaped)
   }
 
-  func test_unresponsiveHealthProbeRecoversOnPublishedPort() async throws {
+  func test_unresponsiveHealthProbeReportsGatewayFailure() async throws {
     let fixture = try fixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     let supervisor = GatewaySupervisor()
     let port = try await supervisor.start(spec: fixture.spec())
     try Data().write(to: fixture.root.appendingPathComponent("wedge"))
 
-    let recoveryFailure = await supervisor.recoverIfNeeded()
-    XCTAssertNil(recoveryFailure)
-    let body = try await URLSession.shared.data(
-      from: URL(string: "http://127.0.0.1:\(port)/healthz")!).0
-    XCTAssertEqual(String(decoding: body, as: UTF8.self), "ok")
+    let healthFailure = await supervisor.health()
+    XCTAssertEqual(healthFailure, "gateway /healthz unreachable on port \(port)")
     let shutdownResult = await supervisor.shutdown(reason: "test")
     XCTAssertTrue(shutdownResult.reaped)
   }

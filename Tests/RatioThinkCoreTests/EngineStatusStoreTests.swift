@@ -208,7 +208,7 @@ final class EngineStatusStoreTests: XCTestCase {
 
   func test_startEngine_forwards_profileID_to_client() async throws {
     let client = StubXPCClient()
-    let store = EngineStatusStore(client: client)
+    let store = EngineStatusStore(client: client, chatBackendProvider: { .daemon })
     try await store.startEngine(profileID: "chat")
     XCTAssertEqual(client.startCalls, 1,
                    "startEngine must forward to the helper XPC client")
@@ -235,7 +235,8 @@ final class EngineStatusStoreTests: XCTestCase {
     let client = StubXPCClient()
     let store = EngineStatusStore(
       client: client,
-      daemonBindModeProvider: { .external }
+      daemonBindModeProvider: { .external },
+      chatBackendProvider: { .daemon }
     )
 
     try await store.startEngine(profileID: "chat")
@@ -247,9 +248,24 @@ final class EngineStatusStoreTests: XCTestCase {
     XCTAssertEqual(store.runtimeDaemonBindMode, .external)
   }
 
+  func test_startEngine_gateway_without_modelOverride_uses_backendAwareSelector() async throws {
+    let client = StubXPCClient()
+    let store = EngineStatusStore(
+      client: client,
+      chatBackendProvider: { .gateway }
+    )
+
+    try await store.startEngine(profileID: "chat")
+
+    XCTAssertEqual(client.startCalls, 1)
+    XCTAssertEqual(client.lastStartProfileID, "chat")
+    XCTAssertNil(client.lastStartModelOverride)
+    XCTAssertNil(client.lastStartBindMode)
+  }
+
   func test_startEngine_explicit_external_bind_is_required_and_recorded() async throws {
     let client = StubXPCClient()
-    let store = EngineStatusStore(client: client)
+    let store = EngineStatusStore(client: client, chatBackendProvider: { .daemon })
 
     try await store.startEngine(profileID: "chat", daemonBindHost: .external)
 
@@ -261,6 +277,7 @@ final class EngineStatusStoreTests: XCTestCase {
     let client = StubXPCClient()
     let store = EngineStatusStore(
       client: client,
+      chatBackendProvider: { .daemon },
       activeProfileIDProvider: { "chat" }
     )
 
