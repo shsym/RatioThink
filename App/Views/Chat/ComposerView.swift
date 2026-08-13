@@ -45,6 +45,13 @@ struct ComposerView: View {
   /// matches the text the gate promised; an edit made during the model
   /// load cancels the auto-send rather than sending mid-rewrite text.
   let autoSubmit: ComposerAutoSubmit?
+  /// The chat-mode (profile) picker, rendered above the input field.
+  ///
+  /// Passed in rather than built here: selecting a profile can trigger a model
+  /// swap, which needs the swap coordinator and the chat's pin state. Keeping
+  /// it a ready-made view leaves the composer unaware of any of that. `nil`
+  /// renders no picker, which is what previews and unit tests want.
+  var modeMenu: ProfileModeMenu? = nil
   @Environment(\.modelContext) private var modelContext
   @EnvironmentObject private var persistenceStatus: PersistenceStatus
   @State private var draft: String = ""
@@ -137,7 +144,8 @@ struct ComposerView: View {
     onStop: @escaping () -> Void = {},
     attachmentEngineTokenLimit: Int? = nil,
     attachmentModelContextLength: Int? = nil,
-    autoSubmit: ComposerAutoSubmit? = nil
+    autoSubmit: ComposerAutoSubmit? = nil,
+    modeMenu: ProfileModeMenu? = nil
   ) {
     self.chat = chat
     self.viewModel = viewModel
@@ -149,10 +157,18 @@ struct ComposerView: View {
     self.attachmentEngineTokenLimit = attachmentEngineTokenLimit
     self.attachmentModelContextLength = attachmentModelContextLength
     self.autoSubmit = autoSubmit
+    self.modeMenu = modeMenu
   }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
+      // Chat-mode picker, above the field rather than in the window toolbar:
+      // the choice applies to the sentence being typed, so it belongs where the
+      // sentence is. Optional so previews and tests can build a composer
+      // without wiring the swap coordinator.
+      if let modeMenu {
+        modeMenu
+      }
       if !pendingAttachments.isEmpty {
         ScrollView(.horizontal, showsIndicators: false) {
           HStack(spacing: 6) {

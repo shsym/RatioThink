@@ -463,8 +463,6 @@ struct ChatScaffoldView: View {
     VStack(spacing: 0) {
       ContentToolbar(
         viewModel: viewModel,
-        availableProfiles: pickerProfileIDs,
-        profileDisplayName: profileDisplayName(forProfileID:),
         // #459's richer model menu (option list + collapsed summary), built
         // from `Chat.modelID` (the #460 authority). #580 grouping + quant tag
         // + unverified shield render inside `ContentToolbar` from these
@@ -481,9 +479,6 @@ struct ChatScaffoldView: View {
         // coordinator, persistence here.
         selectedModelID: chat.modelID,
         profileDefaultModel: selectedProfileDefault,
-        commitSwap: { profileID, pinModel in
-          commitSwap(profileID: profileID, pinModel: pinModel, chat: chat)
-        },
         commitModel: { modelID in persistChatModel(modelID, on: chat) },
         onUseProfileDefault: { _ = persistChatModel(nil, on: chat) },
         followProfileDefaultModel: appPreferences.followProfileDefaultModel,
@@ -613,28 +608,7 @@ struct ChatScaffoldView: View {
             noModelGate(for: chat)
           }
         }
-        ComposerView(
-          chat: chat,
-          viewModel: viewModel,
-          isSending: sendCoordinator.isInFlight(chatID),
-          shouldAllowSend: { sendGateDecision(for: chat).allowsSend },
-          onSendBlocked: { draft in
-            handleBlockedSend(draft: draft, for: chat)
-          },
-          onUserMessageSaved: { _ in
-            // A send committed (manual or fired auto-send) — any armed
-            // pending send is now satisfied or superseded. #516.
-            pendingSend.disarm()
-            cancelDeferredEngineSync()
-            sendAssistantTurn(for: chat)
-          },
-          // #507: the composer's stop button — the user-reachable cancel
-          // for this chat's in-flight turn (review v1 F1).
-          onStop: { sendCoordinator.cancel(chatID: chatID) },
-          attachmentEngineTokenLimit: modelLoadCenter.residentMaxOutputTokens,
-          attachmentModelContextLength: attachmentModelContextCache.contextLength,
-          autoSubmit: pendingSend.autoSubmit
-        )
+        composer(for: chat)
       }
     }
     .background(Color(nsColor: .windowBackgroundColor))
@@ -1250,6 +1224,61 @@ struct ChatScaffoldView: View {
       options: options,
       resume: resume)
     return true
+  }
+
+  /// The input row, including the relocated chat-mode picker above it.
+  ///
+  /// Extracted from `body` for the same reason as `modeMenu(for:)`: inline, the
+  /// enclosing transcript-plus-composer expression exceeded what the Swift type
+  /// checker will solve in reasonable time once the composer gained a further
+  /// argument.
+  private func composer(for chat: Chat) -> some View {
+    ComposerView(
+      chat: chat,
+      viewModel: viewModel,
+      isSending: sendCoordinator.isInFlight(chatID),
+      shouldAllowSend: { sendGateDecision(for: chat).allowsSend },
+      onSendBlocked: { draft in
+        handleBlockedSend(draft: draft, for: chat)
+      },
+      onUserMessageSaved: { _ in
+        // A send committed (manual or fired auto-send) — any armed
+        // pending send is now satisfied or superseded. #516.
+        pendingSend.disarm()
+        cancelDeferredEngineSync()
+        sendAssistantTurn(for: chat)
+      },
+      // #507: the composer's stop button — the user-reachable cancel
+      // for this chat's in-flight turn (review v1 F1).
+      onStop: { sendCoordinator.cancel(chatID: chatID) },
+      attachmentEngineTokenLimit: modelLoadCenter.residentMaxOutputTokens,
+      attachmentModelContextLength: attachmentModelContextCache.contextLength,
+      autoSubmit: pendingSend.autoSubmit,
+      modeMenu: modeMenu(for: chat)
+    )
+  }
+
+  /// The chat-mode picker rendered above the composer's input field, relocated
+  /// from the window toolbar.
+  ///
+  /// Built here rather than inside `ComposerView` because selecting a profile
+  /// can force a model swap, which needs the swap coordinator and the chat's
+  /// pin state. Kept as its own function rather than inlined at the call site:
+  /// inline, the `ComposerView(...)` expression grew past what the Swift type
+  /// checker will solve in reasonable time.
+  private func modeMenu(for chat: Chat) -> ProfileModeMenu {
+    ProfileModeMenu(
+      viewModel: viewModel,
+      availableProfiles: pickerProfileIDs,
+      profileDisplayName: profileDisplayName(forProfileID:),
+      selectedModelID: chat.modelID,
+      profileDefaultModel: selectedProfileDefault,
+      followProfileDefaultModel: appPreferences.followProfileDefaultModel,
+      commitSwap: { profileID, pinModel in
+        commitSwap(profileID: profileID, pinModel: pinModel, chat: chat)
+      },
+      swapCoordinator: swapCoordinator
+    )
   }
 
   private func sendAssistantTurn(for chat: Chat) {

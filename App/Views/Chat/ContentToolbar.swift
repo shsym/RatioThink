@@ -21,10 +21,8 @@ import SwiftUI
 /// the popover content views; this file owns layout + anchoring only.
 struct ContentToolbar: View {
   @ObservedObject var viewModel: ChatTranscriptViewModel
-  let availableProfiles: [String]
-  /// Maps stable profile ids (selection keys) to user-facing profile names.
-  /// Selection still uses ids; this affects only visible toolbar/menu labels.
-  let profileDisplayName: (String) -> String
+  // `availableProfiles` / `profileDisplayName` / `commitSwap` moved out with the
+  // profile menu — see `ProfileModeMenu`, now rendered above the composer.
   /// #459's option list for the model menu (checkmark on current,
   /// profile-default annotation, unavailable reasons, "Manage Models…").
   /// Built by `ChatScaffoldView` from `Chat.modelID` (the #460 authority) +
@@ -49,10 +47,6 @@ struct ContentToolbar: View {
   /// compares against.
   let profileDefaultModel: String?
   /// #460: persists a confirmed profile swap (profile + optional pinned
-  /// model) — wired by `ChatScaffoldView`, which owns the SwiftData write.
-  /// Returns `false` when the model-pin save failed (review F2) so the
-  /// coordinator skips the load and the profile is left unswitched.
-  let commitSwap: ProfileSwapCoordinator.SwapCommit
   /// #460: persists a per-chat model selection — wired by `ChatScaffoldView`.
   /// Returns `false` on a save failure so the coordinator skips the load.
   let commitModel: (String) -> Bool
@@ -118,14 +112,11 @@ struct ContentToolbar: View {
 
   init(
     viewModel: ChatTranscriptViewModel,
-    availableProfiles: [String] = ["chat"],
-    profileDisplayName: @escaping (String) -> String = { $0 },
     modelOptions: [ToolbarModelOptions.Option] = [],
     currentModelSummary: ToolbarModelOptions.CurrentSummary? = nil,
     contextUsage: ContextUsage? = nil,
     selectedModelID: String? = nil,
     profileDefaultModel: String? = nil,
-    commitSwap: @escaping ProfileSwapCoordinator.SwapCommit = { _, _ in true },
     commitModel: @escaping (String) -> Bool = { _ in true },
     onUseProfileDefault: @escaping () -> Void = {},
     followProfileDefaultModel: Bool = false,
@@ -139,14 +130,11 @@ struct ContentToolbar: View {
     onStartEngine: @escaping () -> Void = {}
   ) {
     self.viewModel = viewModel
-    self.availableProfiles = availableProfiles
-    self.profileDisplayName = profileDisplayName
     self.modelOptions = modelOptions
     self.currentModelSummary = currentModelSummary
     self.contextUsage = contextUsage
     self.selectedModelID = selectedModelID
     self.profileDefaultModel = profileDefaultModel
-    self.commitSwap = commitSwap
     self.commitModel = commitModel
     self.onUseProfileDefault = onUseProfileDefault
     self.followProfileDefaultModel = followProfileDefaultModel
@@ -162,8 +150,8 @@ struct ContentToolbar: View {
 
   var body: some View {
     HStack(spacing: 10) {
-      profileMenu
-      FlatDivider()
+      // The profile (i.e. chat-mode) menu used to lead this row. It now sits
+      // directly above the composer's input field — see `ProfileModeMenu`.
       modelMenu
 
       if let writeError = swapCoordinator.defaultModelWriteError {
@@ -215,115 +203,12 @@ struct ContentToolbar: View {
     .padding(.horizontal, 16)
     .padding(.vertical, 8)
     .background(Color(nsColor: .windowBackgroundColor))
-#if DEBUG
-    .task(id: testAutoProfilePickTaskID) {
-      await runTestAutoProfilePickIfNeeded()
-    }
-#endif
     .accessibilityElement(children: .contain)
     .accessibilityIdentifier("content.toolbar")
   }
 
   // MARK: - controls
 
-  private var profileMenu: some View {
-    Menu {
-      ForEach(availableProfiles, id: \.self) { id in
-        Button { selectProfile(id) } label: {
-          Text(profileDisplayName(id))
-        }
-        .accessibilityIdentifier(id)
-        .accessibilityLabel(profileDisplayName(id))
-      }
-    } label: {
-      HStack(spacing: 4) {
-        Image(systemName: "person.crop.circle")
-        Text("Profile: \(profileDisplayName(viewModel.selectedProfileID))")
-      }
-    }
-    .menuStyle(.borderlessButton)
-    .fixedSize()
-    .accessibilityIdentifier("toolbar.profile")
-    // Anchor for the Phase 3.6 confirmation popover. #582: a coordinator-owned
-    // `.applicationDefined` NSPopover (`ProfileSwapPopoverHost`) replaces the
-    // transient SwiftUI `.popover`, which AppKit auto-closed on resign-key —
-    // silently dropping a pending swap when the user Cmd-Tabbed / clicked
-    // another app. The host captures the pending token at present time (review
-    // v2 F4) and hands it back through `confirm(token:)` / `cancel(token:)` /
-    // `keepCurrentModel(token:)`, so a stale callback from a superseded swap is
-    // token-mismatched and dropped.
-    .background(
-      ProfileSwapPopoverHost(
-        pending: swapCoordinator.pending,
-        onConfirm: { token, setAsDefault in
-          swapCoordinator.confirm(token: token, setAsDefault: setAsDefault)
-        },
-        onCancel: { token in swapCoordinator.cancel(token: token) },
-        onKeepCurrent: { token in swapCoordinator.keepCurrentModel(token: token) }
-      )
-    )
-  }
-
-#if DEBUG
-  private static var testAutoPickProfileID: String? {
-    guard let id = ProcessInfo.processInfo.environment["PIE_TEST_AUTO_PICK_PROFILE"],
-          !id.isEmpty
-    else { return nil }
-    return id
-  }
-
-  private var testAutoProfilePickTaskID: String {
-    // #582: the production swap popover is now a coordinator-owned
-    // `.applicationDefined` NSPopover that survives the window resigning key,
-    // so the seam no longer tracks pending-presence to re-raise a popover that
-    // a focus blip killed. #579 added that re-raise because the old transient
-    // `.popover` died on resign-key under a contended seated session — but that
-    // re-raise also MASKED the real production gap. With the gap fixed at the
-    // source, the auto-pick fires exactly once per stable pendable state, and
-    // S459's resign-key-survival case asserts the production NSPopover itself.
-    //
-    // #581 — CONSTRAINT (do not re-key this on `swapCoordinator.pending`):
-    // keying on pending-presence is what made #579's seam incompatible with a
-    // Cancel-outcome assertion. `cancel(token:)` / `dismissCurrentPending()`
-    // clear `pending` WITHOUT mutating `selectedProfileID` (only `commitSwap`
-    // sets it), so a pending-keyed taskID flips back to its pendable value the
-    // instant a deliberate Cancel clears the popover — re-raising the swap once
-    // and bouncing the popover back into a test that asserted it stayed
-    // dismissed. Keying on the stable `(profile, model)` selection instead
-    // means a Cancel leaves the axis untouched (no re-fire), a Confirm trips
-    // the `selectedProfileID != target` guard (no re-fire), so every outcome —
-    // Confirm, Keep-Current, AND Cancel — is safe to assert. A future
-    // cancel-driving GUI scenario relies on this; do not reintroduce pending.
-    [
-      Self.testAutoPickProfileID ?? "",
-      viewModel.selectedProfileID,
-      selectedModelID ?? "",
-    ].joined(separator: "|")
-  }
-
-  @MainActor
-  private func runTestAutoProfilePickIfNeeded() async {
-    guard let target = Self.testAutoPickProfileID,
-          selectedModelID != nil,
-          viewModel.selectedProfileID != target,
-          swapCoordinator.pending == nil
-    else { return }
-
-    // Settle briefly so a still-resolving model selection doesn't race the
-    // pick. NO one-shot latch: the latch-before-await was the solo flake —
-    // `.task(id:)` cancels this task whenever the id changes (e.g.
-    // `selectedModelID` resolves nil→X during the sleep), so a latch set here
-    // permanently skipped the cancelled `selectProfile` and the popover never
-    // appeared. Re-checking after the await fires exactly once per stable
-    // pendable state instead.
-    try? await Task.sleep(nanoseconds: 300_000_000)
-    guard !Task.isCancelled,
-          viewModel.selectedProfileID != target,
-          swapCoordinator.pending == nil
-    else { return }
-    selectProfile(target)
-  }
-#endif
 
   /// #460: the chat's effective current model — the explicit pin
   /// (`selectedModelID`) or, when unpinned, the active profile's default.
@@ -645,24 +530,6 @@ struct ContentToolbar: View {
 
   // MARK: - swap helpers
 
-  private func selectProfile(_ id: String) {
-    // #460: compare against the chat's CURRENT model (`effectiveModelID`),
-    // not engine residency. `commitSwap` persists the profile and — only on
-    // a confirm-and-switch — the new pinned model; a silent swap preserves
-    // the current model (`pinModel == nil`).
-    // #459 "Keep Current Model" needs no `setOverride` under the single
-    // authority: the coordinator builds the keep-current action from this
-    // same `commitSwap`, pinning the CURRENT model (`fromModel`) instead of
-    // the new default — both write `Chat.modelID`.
-    swapCoordinator.requestSwap(
-      toProfileID: id,
-      fromModel: effectiveModelID,
-      preserveExplicitModelSelection: Self.shouldPreserveExplicitModelSelection(
-        selectedModelID: selectedModelID,
-        followProfileDefaultModel: followProfileDefaultModel),
-      commit: commitSwap
-    )
-  }
 
   private func selectModel(_ option: ToolbarModelOptions.Option) {
     Self.performModelSelection(
