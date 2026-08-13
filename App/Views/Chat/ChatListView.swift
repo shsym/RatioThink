@@ -149,7 +149,7 @@ struct ChatListView: View {
   }
 
   private func row(for chat: Chat) -> some View {
-    HStack(alignment: .firstTextBaseline, spacing: 6) {
+    HStack(alignment: .center, spacing: 6) {
       ChatRowLabel(title: chat.title,
                    updatedAt: chat.updatedAt,
                    pinned: chat.pinned,
