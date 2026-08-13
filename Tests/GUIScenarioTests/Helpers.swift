@@ -86,26 +86,16 @@ func openFreshChat(
   let composer = app.descendants(matching: .any)
     .matching(identifier: "composer.text")
     .firstMatch
-  // #577: the Chats launch landing is now a NON-persisting new-chat draft
-  // composer (no chat row until the first send). Most callers of
-  // `openFreshChat` want a PERSISTED chat to interact with (type/send, prune,
-  // rename, select), so we cannot early-return on the draft composer's
-  // presence — that would hand back a chat with no row. Always click a New
-  // Chat affordance (which persists immediately) and confirm a real row landed
-  // in the sidebar before returning.
-  let firstRow = app.descendants(matching: .any)
-    .matching(identifier: "chats.row")
-    .firstMatch
+  // New Chat opens a transient composer. The sidebar row is intentionally not
+  // inserted until the first message is sent, so the composer itself is the
+  // completion condition here.
 
-  // Prefer the larger empty-state affordance when a test starts from an empty
-  // chat DB and fall back to the header icon otherwise. In macOS GUI runs
-  // XCTest can synthesize a click yet leave the SwiftUI action undelivered
-  // while the app is busy settling; after each real user affordance click,
-  // wait on the product condition (a persisted row + composer) before trying
-  // the next affordance.
+  // The fixed first conversation-list row is the single creation affordance.
+  // In macOS GUI runs XCTest can synthesize a click yet leave the SwiftUI action
+  // undelivered while the app is busy settling; wait on the product condition
+  // (the draft composer) before returning.
   let candidates: [(String, XCUIElement)] = [
-    ("empty chat-list New Chat", app.buttons["chats.empty.newButton"]),
-    ("header New Chat", app.buttons["chats.newButton"]),
+    ("conversation-list New Chat", app.buttons["chats.newButton"]),
   ]
 
   // A LATER launch in a multi-test run can come up not-key, presenting an
@@ -119,8 +109,8 @@ func openFreshChat(
       guard button.waitForExistence(timeout: 2) else { continue }
       sawCandidate = true
       button.click()
-      if firstRow.waitForExistence(timeout: 5), composer.waitForExistence(timeout: 5) { return }
-      NSLog("openFreshChat: %@ click did not open a persisted chat; trying next affordance", label)
+      if composer.waitForExistence(timeout: 5) { return }
+      NSLog("openFreshChat: %@ click did not open the draft composer; trying next affordance", label)
     }
     if !sawCandidate {
       NSLog("openFreshChat: no affordance visible (empty tree?); re-activating")
@@ -140,8 +130,8 @@ func openFreshChat(
 /// Select a persisted chat row in the sidebar by its title. #512: a chat
 /// with real conversation is auto-titled from its first user message, so
 /// after a relaunch the persisted row is found by that derived title — the
-/// "New Chat" placeholder now only ever names an empty draft (which pruning
-/// deletes). Shared by every suite that relaunches and reselects a chat.
+/// The "New Chat" placeholder is no longer persisted for untouched drafts.
+/// Shared by every suite that relaunches and reselects a chat.
 @MainActor
 func selectPersistedChat(
   titled title: String,

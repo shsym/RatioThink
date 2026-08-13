@@ -722,7 +722,7 @@ struct RatioThinkApp: App {
       // #411: remove the two orphaned no-op "New Chat" menu commands
       // (⌘N / "New Chat (Always)" ⌘T) that had replaced the default
       // File ▸ New. Both were empty closures — they did nothing, while the
-      // live new-chat affordances drive `ChatCreation.create` directly
+      // live new-chat affordances open a transient composer
       // (chat-list "+" + col-3 zero-state CTA), never a global menu command.
       // Replacing `.newItem` with an empty group drops both items and their
       // ⌘N/⌘T shortcuts, and keeps the default "New Window" suppressed — the

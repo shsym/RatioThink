@@ -1,13 +1,10 @@
 import SwiftUI
-import SwiftData
 
 /// Detail empty-state shown when no item is selected: a large `Start Chat`
 /// CTA for col 3. (The former `Add Endpoint` CTA is gone — the local API is
 /// the engine's single endpoint, surfaced via the API Endpoints section.)
 struct EmptyStateView: View {
   @EnvironmentObject private var windowState: WindowState
-  @EnvironmentObject private var persistenceStatus: PersistenceStatus
-  @Environment(\.modelContext) private var modelContext
 
   var body: some View {
     VStack(spacing: 24) {
@@ -47,16 +44,9 @@ struct EmptyStateView: View {
     .accessibilityIdentifier(title)
   }
 
-  /// Create a chat and route the shell to it — mirrors the chat-list
-  /// New Chat affordance so the zero-state CTA lands the user in a live
-  /// chat rather than dead-ending.
+  /// Open the same non-persisting draft as the conversation-list affordance.
+  /// The chat appears in the sidebar only after its first message is saved.
   private func startChat() {
-    guard let id = ChatCreation.create(
-      in: modelContext,
-      persistenceStatus: persistenceStatus,
-      contextLabel: "EmptyStateView.startChat"
-    ) else { return }
-    windowState.selectedSection = .chats
-    windowState.selectedItemID = id
+    windowState.beginChatDraft(profileID: ProfileStore.defaultProfileID)
   }
 }

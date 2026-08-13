@@ -9,6 +9,7 @@ import SwiftUI
 struct DetailView: View {
   let section: SidebarSection?
   let selectedItemID: UUID?
+  @EnvironmentObject private var windowState: WindowState
 
   var body: some View {
     switch (section, selectedItemID) {
@@ -19,6 +20,11 @@ struct DetailView: View {
       // row via `@Query` keyed on `id`.
       ChatScaffoldView(chatID: id)
         .id(id)
+    case (.chats, nil) where windowState.pendingChatDraft != nil:
+      if let draft = windowState.pendingChatDraft {
+        ChatScaffoldView(draftChat: draft)
+          .id(draft.id)
+      }
     case (.search, _):
       // Sibling destination: a search panel over conversation titles +
       // message bodies. Selecting a result routes back to the Chats section.

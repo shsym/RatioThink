@@ -36,6 +36,10 @@ final class WindowState: ObservableObject {
   @Published var isItemListHidden: Bool = false
   @Published var selectedSection: SidebarSection? = .chats
   @Published var selectedItemID: UUID? = nil
+  /// A new conversation that has not received its first user message yet.
+  /// It stays outside SwiftData so abandoning it never creates a sidebar row
+  /// that immediately has to be deleted.
+  @Published private(set) var pendingChatDraft: Chat? = nil
   /// One-shot handoff for the edit→fork flow (#624). Set to the new
   /// forked chat's id alongside `selectedItemID`; the freshly-mounted
   /// `ChatScaffoldView` for that id consumes it once to kick off the
@@ -48,7 +52,28 @@ final class WindowState: ObservableObject {
   /// (#624). The new scaffold consumes the signal via
   /// `consumePendingForkResend(_:)` on mount.
   func beginForkResend(to chatID: UUID) {
+    pendingChatDraft = nil
     pendingForkResendChatID = chatID
+    selectedSection = .chats
+    selectedItemID = chatID
+  }
+
+  /// Open a composer backed by an in-memory chat. The scaffold persists it
+  /// together with the first user message in one save.
+  func beginChatDraft(profileID: String, modelID: String? = nil) {
+    pendingChatDraft = ChatCreation.makeDraft(profileID: profileID, modelID: modelID)
+    selectedSection = .chats
+    selectedItemID = nil
+  }
+
+  func abandonChatDraft() {
+    pendingChatDraft = nil
+  }
+
+  /// Complete the transient route after the first message is durable.
+  func commitChatDraft(_ chatID: UUID) {
+    guard pendingChatDraft?.id == chatID else { return }
+    pendingChatDraft = nil
     selectedSection = .chats
     selectedItemID = chatID
   }

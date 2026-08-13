@@ -21,6 +21,10 @@ struct ComposerView: View {
   /// The owning chat. Optional only as a defensive guard — a persisting
   /// composer always has a chat; `submit()` bails if it is `nil`.
   let chat: Chat?
+  /// When true, `chat` is a transient configuration object. `submit()` copies
+  /// it into SwiftData and saves that copy with the first user message, so an
+  /// empty chat never appears in the conversation list.
+  let insertChatOnSubmit: Bool
   @ObservedObject var viewModel: ChatTranscriptViewModel
   let isSending: Bool
   /// : gate evaluated before the user message is persisted. When it
@@ -129,6 +133,7 @@ struct ComposerView: View {
 
   init(
     chat: Chat?,
+    insertChatOnSubmit: Bool = false,
     viewModel: ChatTranscriptViewModel,
     isSending: Bool = false,
     shouldAllowSend: @escaping () -> Bool = { true },
@@ -140,6 +145,7 @@ struct ComposerView: View {
     autoSubmit: ComposerAutoSubmit? = nil
   ) {
     self.chat = chat
+    self.insertChatOnSubmit = insertChatOnSubmit
     self.viewModel = viewModel
     self.isSending = isSending
     self.shouldAllowSend = shouldAllowSend
@@ -277,7 +283,18 @@ struct ComposerView: View {
     }
     // A persisting composer always has a chat; bail rather than crash if the
     // defensive optional is ever nil.
-    guard let chat else { return }
+    guard let sourceChat = chat else { return }
+    let chat = insertChatOnSubmit
+      ? Chat(
+          id: sourceChat.id,
+          title: sourceChat.title,
+          profileID: sourceChat.profileID,
+          modelID: sourceChat.modelID,
+          createdAt: sourceChat.createdAt,
+          updatedAt: sourceChat.updatedAt,
+          pinned: sourceChat.pinned,
+          userTitled: sourceChat.userTitled)
+      : sourceChat
     // Establish the relationship from the to-many owning side
     // exclusively ( F11). Setting `Message.chat` AND appending
     // to `chat.messages` double-wires the inverse and has surfaced
@@ -292,6 +309,9 @@ struct ComposerView: View {
     )
     let previousUpdatedAt = chat.updatedAt
     let previousTitle = chat.title
+    if insertChatOnSubmit {
+      modelContext.insert(chat)
+    }
     modelContext.insert(message)
     chat.messages.append(message)
     chat.updatedAt = message.ts
@@ -317,6 +337,9 @@ struct ComposerView: View {
       modelContext.delete(message)
       chat.updatedAt = previousUpdatedAt
       chat.title = previousTitle
+      if insertChatOnSubmit {
+        modelContext.delete(chat)
+      }
       persistenceStatus.report(error, context: "ComposerView.submit")
     }
   }

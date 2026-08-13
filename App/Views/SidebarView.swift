@@ -9,10 +9,11 @@ import SwiftUI
 ///     sections (Workflows, …) slot in alongside the list here.
 ///
 /// The Chats top entry clears the item selection so the detail surface lands on
-/// the empty-state CTA; new chats are started from the titlebar new-chat
-/// button. Search is a sibling destination whose detail view searches
+/// the empty-state CTA; new chats are started from the conversation list's
+/// fixed first row. Search is a sibling destination whose detail view searches
 /// conversation titles + message bodies.
 struct SidebarView: View {
+  @EnvironmentObject private var windowState: WindowState
   @Binding var selection: SidebarSection?
   @Binding var selectedItemID: UUID?
   let isItemListHidden: Bool
@@ -22,17 +23,24 @@ struct SidebarView: View {
       // TOP region: view selector.
       sidebarRow(.chats) {
         // Selecting Chats clears the selection so the detail surface shows the
-        // empty-state landing; the titlebar button starts a new chat.
+        // empty-state landing; the conversation list starts a new chat.
+        windowState.abandonChatDraft()
         selection = .chats
         selectedItemID = nil
       }
       // Sibling destination: a search panel (detail column) over conversation
       // titles + message bodies.
-      sidebarRow(.search) { selection = .search }
+      sidebarRow(.search) {
+        windowState.abandonChatDraft()
+        selection = .search
+      }
       // #422: the API Endpoints section mirrors the live engine HTTP endpoint
       // (LocalAPIView). Selecting it shows the single status view in the
       // detail column; the chat list below stays put.
-      sidebarRow(.apiEndpoints) { selection = .apiEndpoints }
+      sidebarRow(.apiEndpoints) {
+        windowState.abandonChatDraft()
+        selection = .apiEndpoints
+      }
 
       // BOTTOM region: persistent shortcut area. The chat list is always
       // mounted (it does not unmount when a non-Chat section is selected);

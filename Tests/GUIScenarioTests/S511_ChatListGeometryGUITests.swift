@@ -70,7 +70,7 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
   private func seedChats(_ count: Int, in app: XCUIApplication) {
     let newButton = app.buttons["chats.newButton"]
     XCTAssertTrue(newButton.waitForExistence(timeout: 5),
-                  "chat list header New Chat affordance missing")
+                  "conversation-list New Chat button missing")
     let rows = app.descendants(matching: .any).matching(identifier: "chats.row")
     for i in 1...count {
       // Space clicks past the host double-click interval so repeated header
@@ -78,11 +78,8 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
       let clickSpacing = max(NSEvent.doubleClickInterval, 0.4) + 0.1
       RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(clickSpacing))
       newButton.click()
-      let deadline = Date().addingTimeInterval(5)
-      while rows.count < i && Date() < deadline {
-        usleep(200_000)
-      }
-      XCTAssertEqual(rows.count, i, "chat \(i) did not appear after New Chat click")
+      XCTAssertEqual(rows.count, i - 1,
+                     "transient chat \(i) must not create a row before send")
       let title = "Geometry seed chat \(i)"
       typeComposerText(title, in: app)
       let send = app.buttons["composer.send"]
@@ -93,6 +90,11 @@ final class S511_ChatListGeometryGUITests: XCTestCase {
       send.click()
       XCTAssertTrue(app.staticTexts[title].waitForExistence(timeout: 10),
                     "chat \(i) did not auto-title after failed send; app tree: \(app.debugDescription)")
+      let deadline = Date().addingTimeInterval(5)
+      while rows.count < i && Date() < deadline {
+        usleep(200_000)
+      }
+      XCTAssertEqual(rows.count, i, "chat \(i) did not appear after its first send")
     }
   }
 

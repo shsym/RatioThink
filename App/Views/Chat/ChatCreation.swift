@@ -1,13 +1,25 @@
 import Foundation
 import SwiftData
 
-/// Shared "insert a fresh chat" path used by both the chat-list New Chat
-/// affordance and the col-3 zero-state CTA. Centralizing it keeps the
-/// save + rollback-on-failure behavior identical wherever a chat is
-/// created — the in-memory insert is rolled back on a save error so the
-/// `@Query`-backed sidebar never surfaces a row that is not on disk.
+/// Construction helpers for new chats. User-facing creation begins with
+/// `makeDraft`; the composer persists that draft's values with the first
+/// message. `create` remains the explicit immediate-persistence primitive for
+/// callers that already have durable chat content to attach.
 @available(macOS 14, *)
 enum ChatCreation {
+  /// Build a chat without inserting it. New-conversation surfaces use this
+  /// until the first user message can be saved atomically with the chat.
+  @MainActor
+  static func makeDraft(
+    profileID: String = "chat",
+    modelID: String? = nil
+  ) -> Chat {
+    Chat(
+      profileID: profileID,
+      modelID: modelID ?? debugPinnedChatModel()
+    )
+  }
+
   /// Insert and persist a new chat, returning its id. On a save failure
   /// the insert is rolled back, the error is reported, and `nil` is
   /// returned so the caller leaves selection untouched.
@@ -36,8 +48,7 @@ enum ChatCreation {
       return nil
     }
     #endif
-    let resolvedModelID = modelID ?? debugPinnedChatModel()
-    let chat = Chat(profileID: profileID, modelID: resolvedModelID)
+    let chat = makeDraft(profileID: profileID, modelID: modelID)
     context.insert(chat)
     do {
       try context.save()
