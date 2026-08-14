@@ -175,7 +175,7 @@ struct ComposerView: View {
           .foregroundStyle(.secondary)
           .accessibilityIdentifier("composer.attachmentNotice")
       }
-      HStack(alignment: .bottom, spacing: 8) {
+      HStack(alignment: .center, spacing: 8) {
         Button(action: openAttachmentPanel) {
           Image(systemName: "paperclip.circle")
             .font(.system(size: 24, weight: .regular))
