@@ -112,6 +112,7 @@ struct ConversationSearchView: View {
 
   private func resultCard(_ result: ConversationSearchResult) -> some View {
     Button {
+      windowState.abandonChatDraft()
       windowState.selectedSection = .chats
       windowState.selectedItemID = result.id
     } label: {
@@ -139,6 +140,7 @@ struct ConversationSearchView: View {
       .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
+    .accessibilityIdentifier("search.result")
   }
 
   /// Highlight each case-insensitive occurrence of the current query inside

@@ -48,9 +48,8 @@ final class S285_ZeroStateGUITests: XCTestCase {
     return app
   }
 
-  /// Empty chat DB → the sidebar shows a top-aligned "No chats yet" placeholder
-  /// with an inline New Chat button, and the titlebar new-chat button is
-  /// present. The placeholder must sit in the upper half, not float to center.
+  /// Empty chat DB → the sidebar keeps the new-conversation button as its fixed
+  /// first list row, followed by a top-aligned "No chats yet" placeholder.
   @MainActor
   func test_chat_empty_state_keeps_new_chat_top_aligned() async throws {
     let app = makeApp()
@@ -62,24 +61,26 @@ final class S285_ZeroStateGUITests: XCTestCase {
     let window = app.windows.firstMatch
     XCTAssertTrue(window.waitForExistence(timeout: 5), "main window missing")
 
-    // The primary new-chat affordance lives in the titlebar.
-    XCTAssertTrue(app.buttons["chats.newButton"].waitForExistence(timeout: 5),
-                  "titlebar New Chat affordance missing")
+    let newButton = app.buttons["chats.newButton"]
+    XCTAssertTrue(newButton.waitForExistence(timeout: 5),
+                  "conversation-list New Chat button missing")
     // Conversation search is a sidebar destination, not an inline filter.
     XCTAssertFalse(app.textFields["chats.searchField"].exists,
                    "the chat list must not carry an inline search field")
 
-    let emptyNew = app.buttons["chats.empty.newButton"]
-    XCTAssertTrue(emptyNew.waitForExistence(timeout: 5),
-                  "empty-state New Chat affordance missing (empty chat DB expected)")
-    // Top-aligned: the empty-state affordance lives in the upper half of the
-    // window. A vertically-centered placeholder would land near midY.
-    XCTAssertLessThan(emptyNew.frame.maxY, window.frame.midY,
-                      "empty-state New Chat must be top-aligned, not vertically centered")
+    XCTAssertFalse(app.buttons["chats.empty.newButton"].exists,
+                   "the duplicate empty-state New Chat button must be removed")
+    let emptyLabel = app.staticTexts["chats.empty.label"]
+    XCTAssertTrue(emptyLabel.waitForExistence(timeout: 5),
+                  "empty chat list must report that it has no conversations")
+    XCTAssertLessThan(newButton.frame.maxY, emptyLabel.frame.minY,
+                      "New Chat must be the first conversation-list row")
+    XCTAssertLessThan(emptyLabel.frame.maxY, window.frame.midY,
+                      "the empty-state label must stay top-aligned")
   }
 
-  /// The detail zero-state "Start Chat" CTA must create a chat and open it
-  /// (a live composer), not dead-end.
+  /// The detail zero-state "Start Chat" CTA must open a live transient
+  /// composer without inserting an empty conversation row.
   @MainActor
   func test_start_chat_cta_opens_a_live_chat() async throws {
     let app = makeApp()
@@ -96,10 +97,13 @@ final class S285_ZeroStateGUITests: XCTestCase {
     XCTAssertTrue(app.descendants(matching: .any).matching(identifier: "composer.text")
                     .firstMatch.waitForExistence(timeout: 5),
                   "'Start Chat' must open a live chat composer")
+    XCTAssertEqual(app.descendants(matching: .any)
+      .matching(identifier: "chats.row").count, 0,
+                   "'Start Chat' must not persist a row before the first send")
   }
 
   /// #422: selecting the "API Endpoints" sidebar section opens the single live
-  /// `LocalAPIView`; the titlebar new-chat button stays available, and there is
+  /// `LocalAPIView`; the conversation-list New Chat button stays available, and there is
   /// no inline chat search field.
   @MainActor
   func test_api_endpoints_section_opens_local_api_view() async throws {
@@ -118,7 +122,7 @@ final class S285_ZeroStateGUITests: XCTestCase {
                     .firstMatch.waitForExistence(timeout: 5),
                   "LocalAPIView must always show the read-only security posture")
     XCTAssertTrue(app.buttons["chats.newButton"].exists,
-                  "titlebar New Chat button must stay available in the API Endpoints view")
+                  "conversation-list New Chat must stay available in the API Endpoints view")
     XCTAssertFalse(app.textFields["chats.searchField"].exists,
                    "there must be no inline chat search field")
   }

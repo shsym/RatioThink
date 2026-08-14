@@ -31,6 +31,10 @@ final class S586_SidebarSearchGUITests: XCTestCase {
     let home = "/tmp/pie-s586-" + UUID().uuidString
     tempHomes.append(home)
     app.launchEnvironment["PIE_HOME"] = home
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "s586-deterministic"
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
+    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
     return app
   }
 
@@ -61,7 +65,7 @@ final class S586_SidebarSearchGUITests: XCTestCase {
                   "a non-matching query must show the empty-results message")
   }
 
-  /// A conversation created via the titlebar new-chat button is findable by
+  /// A conversation created via the conversation-list New Chat button is findable by
   /// its title, and selecting the result routes back to the chat.
   @MainActor
   func test_search_finds_a_conversation_by_title() async throws {
@@ -71,12 +75,16 @@ final class S586_SidebarSearchGUITests: XCTestCase {
     XCTAssert(app.wait(for: .runningForeground, timeout: 5))
     app.activate()
 
-    // Create a chat (default title "New Chat") via the titlebar affordance.
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 5), "titlebar new-chat button missing")
-    newChat.click()
+    let title = "Searchable conversation"
+    openFreshChat(in: app)
+    typeComposerText(title, in: app)
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5), "composer send button missing")
+    send.click()
+    XCTAssertTrue(app.staticTexts[title].waitForExistence(timeout: 10),
+                  "first send did not create a searchable conversation")
 
-    // Switch to Search and query the default title.
+    // Switch to Search and query the auto-derived title.
     let navRow = app.descendants(matching: .any).matching(identifier: "Search").firstMatch
     XCTAssertTrue(navRow.waitForExistence(timeout: 5), "sidebar 'Search' nav row missing")
     navRow.click()
@@ -84,16 +92,17 @@ final class S586_SidebarSearchGUITests: XCTestCase {
     let field = app.textFields["search.field"]
     XCTAssertTrue(field.waitForExistence(timeout: 5), "search field missing")
     field.click()
-    field.typeText("New Chat")
+    field.typeText(title)
 
-    // The matched conversation surfaces in the boxed results list. Each result
-    // is a Button, so its title folds into the button's accessibility label.
+    // The matched conversation surfaces in the boxed results list. Use the
+    // stable result-card identifier: title + snippet can be folded into a
+    // synthesized accessibility label whose exact text is not a contract.
     let results = app.descendants(matching: .any).matching(identifier: "search.results").firstMatch
     XCTAssertTrue(results.waitForExistence(timeout: 5),
                   "search must render the boxed results list for a matching query")
-    let hit = app.buttons["New Chat"].firstMatch
+    let hit = results.buttons["search.result"].firstMatch
     XCTAssertTrue(hit.waitForExistence(timeout: 5),
-                  "search should surface the created 'New Chat' conversation")
+                  "search should surface the created conversation")
 
     // Selecting a result routes back to Chats and opens that conversation.
     hit.click()

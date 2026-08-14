@@ -41,6 +41,9 @@ struct AttachmentModelContextLengthCache: Equatable {
 /// updatedAt bump) without manual observation.
 struct ChatScaffoldView: View {
   @Query private var chats: [Chat]
+  /// Non-nil only while a new conversation is still outside SwiftData.
+  /// `DetailView` remounts the query-backed form after its first message saves.
+  private let draftChat: Chat?
   @Environment(\.modelContext) private var modelContext
   @StateObject private var viewModel: ChatTranscriptViewModel
   /// #507: send pipelines are app-scoped (one controller per chat, owned by
@@ -218,13 +221,32 @@ struct ChatScaffoldView: View {
     _chats = Query(filter: #Predicate<Chat> { $0.id == id })
     _viewModel = StateObject(wrappedValue: ChatTranscriptViewModel())
     self.chatID = id
+    self.draftChat = nil
     self.availableProfiles = availableProfiles
     self.availableModels = availableModels
   }
 
+  init(
+    draftChat: Chat,
+    availableProfiles: [String] = ["chat"],
+    availableModels: [String] = ChatTranscriptViewModel.placeholderModels
+  ) {
+    let id = draftChat.id
+    _chats = Query(filter: #Predicate<Chat> { $0.id == id })
+    _viewModel = StateObject(wrappedValue: ChatTranscriptViewModel())
+    self.chatID = id
+    self.draftChat = draftChat
+    self.availableProfiles = availableProfiles
+    self.availableModels = availableModels
+  }
+
+  private var activeChat: Chat? {
+    chats.first ?? draftChat
+  }
+
   var body: some View {
     Group {
-      if let chat = chats.first {
+      if let chat = activeChat {
         scaffold(for: chat)
       } else {
         // Selection points at a chat that no longer exists (deleted
@@ -288,7 +310,7 @@ struct ChatScaffoldView: View {
   private func maybePromptEngineStartOnLaunch() {
     if engineCoordinator.shouldPromptEngineStartOnLaunch(
         autoStartEnabled: appPreferences.localAPIAutoStartEnabled,
-        target: Self.gateTarget(selectedModelID: chats.first?.modelID,
+        target: Self.gateTarget(selectedModelID: activeChat?.modelID,
                                 profileDefaultModel: selectedProfileDefault)) {
       showNoModelPrompt = true
     }
@@ -336,7 +358,7 @@ struct ChatScaffoldView: View {
     // against the helper's own profile store). A nil/blank selection falls
     // back to the profile default. #460: the selection is `Chat.modelID` (the
     // single authority), read from this view's single chat.
-    let modelOverride = chats.first?.modelID
+    let modelOverride = activeChat?.modelID
     Task { @MainActor in
       do {
         engineActionError = nil
@@ -372,7 +394,7 @@ struct ChatScaffoldView: View {
     var ignored = false  // F4: the swap path owns no persistent in-flight flag
     let outcome = Self.profileSwapEngineOutcome(
       newProfileID: newProfileID,
-      chatModelID: chats.first?.modelID,
+      chatModelID: activeChat?.modelID,
       newProfileDefaultModel: profileStore.model(forProfileID: newProfileID),
       status: engineStatusStore.status,
       restartInFlight: &ignored)
@@ -380,7 +402,7 @@ struct ChatScaffoldView: View {
     // `.restart` implies a running engine and a non-nil resolved target
     // (the gate returns `.selectOnly` for a nil model — F2), so this unwrap
     // succeeds; it also re-reads the target through the single resolver.
-    guard let chat = chats.first, let target = gateTarget(for: chat)?.modelID else { return }
+    guard let chat = activeChat, let target = gateTarget(for: chat)?.modelID else { return }
     switch Self.profileSwapRelaunchDecision(inFlightChatIDs: sendCoordinator.inFlightChatIDs) {
     case .runNow:
       loadDefaultModel(target, for: chat)
@@ -445,7 +467,7 @@ struct ChatScaffoldView: View {
   /// `toolbarServedModelIDs`). `chats.first` is this view's single chat.
   private var toolbarCurrentModelSummary: ToolbarModelOptions.CurrentSummary? {
     ToolbarModelOptions.currentSummary(
-      modelOverride: chats.first?.modelID,
+      modelOverride: activeChat?.modelID,
       residentModelID: nil,
       profileDefaultModelID: selectedProfileDefault)
   }
@@ -455,7 +477,7 @@ struct ChatScaffoldView: View {
       discoveredModels: library.installed,
       servedModelIDs: toolbarServedModelIDs,
       profileDefaultModelID: selectedProfileDefault,
-      modelOverride: chats.first?.modelID,
+      modelOverride: activeChat?.modelID,
       residentModelID: nil)
   }
 
@@ -615,18 +637,26 @@ struct ChatScaffoldView: View {
         }
         ComposerView(
           chat: chat,
+          insertChatOnSubmit: draftChat != nil,
           viewModel: viewModel,
           isSending: sendCoordinator.isInFlight(chatID),
           shouldAllowSend: { sendGateDecision(for: chat).allowsSend },
           onSendBlocked: { draft in
             handleBlockedSend(draft: draft, for: chat)
           },
-          onUserMessageSaved: { _ in
+          onUserMessageSaved: { message in
             // A send committed (manual or fired auto-send) — any armed
             // pending send is now satisfied or superseded. #516.
             pendingSend.disarm()
             cancelDeferredEngineSync()
-            sendAssistantTurn(for: chat)
+            // For a transient composer the saved message owns the new persisted
+            // chat copy. Send against that object, then replace the draft route
+            // with the normal query-backed selection.
+            let savedChat = message.chat ?? chat
+            sendAssistantTurn(for: savedChat)
+            if draftChat != nil {
+              windowState.commitChatDraft(savedChat.id)
+            }
           },
           // #507: the composer's stop button — the user-reachable cancel
           // for this chat's in-flight turn (review v1 F1).

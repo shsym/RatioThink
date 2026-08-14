@@ -3,7 +3,7 @@ import SwiftData
 
 /// Chat list embedded under the left Chat navigation entry. Backed by
 /// SwiftData: pinned chats sort to the top, then most-recently-updated.
-/// New chats are started from the titlebar new-chat button; per-row delete
+/// The new-conversation button is always the first list row; per-row delete
 /// cascades to its messages via `Chat.messages`' `.cascade` rule.
 ///
 /// Conversation search is a sibling sidebar destination (`SidebarSection.search`
@@ -18,6 +18,7 @@ struct ChatListView: View {
   /// candidate KV snapshots before the cascade drops the rows (the engine keeps
   /// the KV otherwise).
   @EnvironmentObject private var engineStore: EngineClientStore
+  @EnvironmentObject private var windowState: WindowState
   /// Sort by `updatedAt` desc at the query layer; pinned-first ordering happens
   /// client-side in `sortedChats` because `Bool` doesn't conform to
   /// `Comparable` and SwiftData rejects `SortDescriptor(\.pinned)` at compile
@@ -48,11 +49,7 @@ struct ChatListView: View {
   var body: some View {
     VStack(spacing: 0) {
       header
-      if chats.isEmpty {
-        emptyState
-      } else {
-        list
-      }
+      list
     }
   }
 
@@ -86,6 +83,7 @@ struct ChatListView: View {
     Binding(
       get: { selectedSection == .chats ? selectedItemID : nil },
       set: { newID in
+        if newID != nil { windowState.abandonChatDraft() }
         selectedItemID = newID
         if newID != nil { selectedSection = .chats }
       }
@@ -94,35 +92,40 @@ struct ChatListView: View {
 
   private var list: some View {
     List(selection: rowSelection) {
-      ForEach(sortedChats) { chat in
-        row(for: chat)
-          .tag(chat.id)
-          // Share the left-menu metric so rows line up with the nav rows and
-          // the header above them.
-          .listRowInsets(EdgeInsets(
-            top: SidebarMetrics.rowVerticalPadding,
-            leading: SidebarMetrics.rowHorizontalPadding,
-            bottom: SidebarMetrics.rowVerticalPadding,
-            trailing: SidebarMetrics.rowHorizontalPadding
-          ))
-          .contextMenu {
-            Button(chat.pinned ? "Unpin" : "Pin") {
-              togglePin(chat)
+      newChatButton
+        .listRowInsets(rowInsets)
+        .listRowSeparator(.hidden)
+
+      if chats.isEmpty {
+        emptyState
+          .listRowInsets(rowInsets)
+          .listRowSeparator(.hidden)
+      } else {
+        ForEach(sortedChats) { chat in
+          row(for: chat)
+            .tag(chat.id)
+            // Share the left-menu metric so rows line up with the nav rows and
+            // the header above them.
+            .listRowInsets(rowInsets)
+            .contextMenu {
+              Button(chat.pinned ? "Unpin" : "Pin") {
+                togglePin(chat)
+              }
+              Button("Rename") {
+                renameDraft = chat.title
+                renamingChatID = chat.id
+              }
+              Divider()
+              Button("Delete", role: .destructive) {
+                delete(chat)
+              }
             }
-            Button("Rename") {
-              renameDraft = chat.title
-              renamingChatID = chat.id
-            }
-            Divider()
-            Button("Delete", role: .destructive) {
-              delete(chat)
-            }
+        }
+        .onDelete { offsets in
+          let snapshot = sortedChats
+          for index in offsets {
+            delete(snapshot[index])
           }
-      }
-      .onDelete { offsets in
-        let snapshot = sortedChats
-        for index in offsets {
-          delete(snapshot[index])
         }
       }
     }
@@ -146,6 +149,42 @@ struct ChatListView: View {
       }
       Button("Cancel", role: .cancel) {}
     }
+  }
+
+  private var rowInsets: EdgeInsets {
+    EdgeInsets(
+      top: SidebarMetrics.rowVerticalPadding,
+      leading: SidebarMetrics.rowHorizontalPadding,
+      bottom: SidebarMetrics.rowVerticalPadding,
+      trailing: SidebarMetrics.rowHorizontalPadding
+    )
+  }
+
+  /// Fixed first row for starting a conversation. The visible control stays
+  /// icon-only because the plus is the familiar creation symbol.
+  private var newChatButton: some View {
+    Button {
+      beginChatDraft()
+    } label: {
+      HStack {
+        Image(systemName: "plus")
+          .sidebarIcon()
+          .foregroundStyle(.primary)
+        Spacer(minLength: 0)
+      }
+      .padding(.horizontal, 8)
+      .padding(.vertical, 5)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(
+        RoundedRectangle(cornerRadius: 6)
+          .fill(Color.primary.opacity(0.08))
+      )
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .help("New Chat")
+    .accessibilityLabel("New conversation")
+    .accessibilityIdentifier("chats.newButton")
   }
 
   private func row(for chat: Chat) -> some View {
@@ -176,46 +215,24 @@ struct ChatListView: View {
     }
   }
 
-  /// Top-aligned empty placeholder + inline New Chat button. The trailing
-  /// `Spacer` pins the placeholder directly under the header rather than
-  /// letting it float to the vertical center.
+  /// With creation fixed above, the empty state only reports list content.
   private var emptyState: some View {
-    VStack(alignment: .leading, spacing: 8) {
-      Text("No chats yet")
-        .font(.subheadline)
-        .foregroundStyle(.secondary)
-      Button(action: createChat) {
-        Label("New Chat", systemImage: "square.and.pencil")
-      }
-      .buttonStyle(.borderless)
-      .accessibilityIdentifier("chats.empty.newButton")
-      Spacer(minLength: 0)
-    }
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .padding(.horizontal, 12)
-    .padding(.vertical, 8)
+    Text("No chats yet")
+      .font(.subheadline)
+      .foregroundStyle(.secondary)
+      .accessibilityIdentifier("chats.empty.label")
+      .frame(maxWidth: .infinity, alignment: .leading)
   }
 
   // MARK: - mutations
 
-  private func createChat() {
-    // #460: inherit the active profile + concrete model from the chat the
-    // user was already in, so "New Chat" preserves the same profile/model
-    // context. With no current selection (e.g. first chat) fall back to the
-    // creation defaults.
+  private func beginChatDraft(profileID: String? = nil) {
+    // Preserve the current profile and concrete model when this generic action
+    // starts a new chat. A future mode-specific menu can override `profileID`.
     let source = selectedItemID.flatMap { id in chats.first { $0.id == id } }
-    if let id = ChatCreation.create(
-      in: modelContext,
-      persistenceStatus: persistenceStatus,
-      contextLabel: "ChatListView.createChat",
-      profileID: source?.profileID ?? "chat",
-      modelID: source?.modelID
-    ) {
-      selectedItemID = id
-      // The list is visible from any section; a New Chat created here must
-      // also route the main view to the chat surface.
-      selectedSection = .chats
-    }
+    windowState.beginChatDraft(
+      profileID: profileID ?? source?.profileID ?? ProfileStore.defaultProfileID,
+      modelID: source?.modelID)
   }
 
   /// #512 manual rename: trim, refuse an empty result (keep the old

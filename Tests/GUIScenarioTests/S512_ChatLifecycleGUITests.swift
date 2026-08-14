@@ -1,9 +1,9 @@
 import XCTest
 
-/// #512 — chat lifecycle through the GUI: an untouched "New Chat" draft is
-/// pruned when the user leaves it (and at launch reconcile), while a chat
-/// with a committed user message survives — even when the send FAILS — and
-/// is auto-titled from that first message in the sidebar.
+/// #512 — chat lifecycle through the GUI: an untouched draft never enters the
+/// persisted conversation list, while a chat with a committed user message
+/// survives — even when the send FAILS — and is auto-titled from that first
+/// message in the sidebar.
 ///
 /// Engine-free: pruning needs no engine at all; the failed-send case points
 /// `PIE_TEST_ENGINE_BASE_URL` at a closed port so the user turn commits and
@@ -81,14 +81,11 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     }
   }
 
-  /// Quitting with an untouched "New Chat" draft selected leaves a shell
-  /// on disk; the next launch's reconcile removes it — the relaunch lands
-  /// on the empty chat-list placeholder, never a stale draft row. (The
-  /// switch-away prune is covered in the failed-send test below, where a
-  /// real row exists to switch to.)
+  /// Opening an untouched draft never inserts a sidebar row, and quitting
+  /// cannot leave anything for launch reconciliation to clean up.
   @MainActor
-  func test_empty_chat_pruned_by_launch_reconcile() async throws {
-    let home = freshHome("prune")
+  func test_untouched_draft_never_creates_sidebar_row_or_persists() async throws {
+    let home = freshHome("transient")
     let app = makeApp(pieHome: home)
     app.launch()
     defer { app.terminate() }
@@ -96,8 +93,11 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     app.activate()
 
     openFreshChat(in: app)
-    XCTAssertTrue(waitForNewChatRowCount(1, in: app),
-                  "first draft chat row missing; app tree: \(app.debugDescription)")
+    XCTAssertTrue(app.descendants(matching: .any)
+      .matching(identifier: "composer.text").firstMatch.exists,
+                  "draft composer missing; app tree: \(app.debugDescription)")
+    XCTAssertTrue(waitForNewChatRowCount(0, in: app),
+                  "an untouched draft must not create a sidebar row; app tree: \(app.debugDescription)")
 
     app.terminate()
     let relaunched = makeApp(pieHome: home)
@@ -106,38 +106,45 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     XCTAssert(relaunched.wait(for: .runningForeground, timeout: 10))
     relaunched.activate()
 
-    XCTAssertTrue(relaunched.buttons["chats.empty.newButton"].waitForExistence(timeout: 10),
-                  "launch reconcile must prune the leftover empty draft (empty chat-list placeholder expected); app tree: \(relaunched.debugDescription)")
-    // Review F2: the row count is scoped to `chats.list`, which counts 0
-    // over a missing element — prove the sidebar actually rendered (list
-    // or its empty placeholder) before trusting count == 0.
-    XCTAssertTrue(chatList(in: relaunched).exists || relaunched.buttons["chats.empty.newButton"].exists,
+    XCTAssertTrue(relaunched.staticTexts["chats.empty.label"].waitForExistence(timeout: 10),
+                  "an untouched transient draft must leave the store empty; app tree: \(relaunched.debugDescription)")
+    XCTAssertTrue(chatList(in: relaunched).exists || relaunched.staticTexts["chats.empty.label"].exists,
                   "sidebar never rendered — a scoped row count of 0 would be vacuous; app tree: \(relaunched.debugDescription)")
     XCTAssertTrue(waitForNewChatRowCount(0, in: relaunched),
-                  "no 'New Chat' shell may survive the launch reconcile; app tree: \(relaunched.debugDescription)")
+                  "no draft row may appear after relaunch; app tree: \(relaunched.debugDescription)")
   }
 
-  /// Manual rename via the row context menu: the new title shows in the
-  /// sidebar, and the renamed chat — though EMPTY — survives switch-away
-  /// and relaunch (a user-set title is permanent intent, never pruned).
+  /// Manual rename via the row context menu remains available once the first
+  /// message has made the chat persistent, and the title survives relaunch.
   @MainActor
-  func test_context_menu_rename_persists_and_protects_empty_chat() async throws {
+  func test_context_menu_rename_persists_after_first_send() async throws {
     let customTitle = "Research scratchpad"
+    let initialPrompt = "Notes for a research plan"
     let home = freshHome("rename")
     let app = makeApp(pieHome: home)
+    app.launchEnvironment["PIE_TEST_CHAT_MODEL_PIN"] = "s512-deterministic"
+    app.launchEnvironment["PIE_TEST_PIN_ENGINE_RUNNING"] = "1"
+    app.launchEnvironment["PIE_TEST_ENGINE_BASE_URL"] = "http://127.0.0.1:9"
+    app.launchEnvironment["PIE_TEST_PIN_HELPER_HEALTH"] = "healthy"
     app.launch()
     defer { app.terminate() }
     XCTAssert(app.wait(for: .runningForeground, timeout: 10))
     app.activate()
 
     openFreshChat(in: app)
-    XCTAssertTrue(waitForNewChatRowCount(1, in: app),
-                  "draft chat row missing; app tree: \(app.debugDescription)")
+    XCTAssertTrue(waitForNewChatRowCount(0, in: app),
+                  "draft must not create a row before send; app tree: \(app.debugDescription)")
+    typeComposerText(initialPrompt, in: app)
+    let send = app.buttons["composer.send"]
+    XCTAssertTrue(send.waitForExistence(timeout: 5))
+    send.click()
+    XCTAssertTrue(sidebarRow(titled: initialPrompt, in: app).waitForExistence(timeout: 10),
+                  "first send did not create the titled row; app tree: \(app.debugDescription)")
 
     // Open the row context menu and pick Rename. The synthesized
     // right-click can leave the menu half-presented or miss the item on a
     // busy session (the S486 hazard) — reset with Escape and retry.
-    let row = sidebarRow(titled: "New Chat", in: app)
+    let row = sidebarRow(titled: initialPrompt, in: app)
     XCTAssertTrue(row.waitForExistence(timeout: 5))
     var openedRename = false
     for _ in 0..<3 {
@@ -173,8 +180,7 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     XCTAssertTrue(sidebarRow(titled: customTitle, in: app).waitForExistence(timeout: 5),
                   "renamed title not shown in sidebar; app tree: \(app.debugDescription)")
 
-    // Relaunch: the renamed chat is EMPTY, but a user-set title is
-    // intent — the launch reconcile must keep it.
+    // Relaunch: the user-set title is durable.
     app.terminate()
     let relaunched = makeApp(pieHome: home)
     relaunched.launch()
@@ -183,17 +189,11 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     relaunched.activate()
 
     XCTAssertTrue(sidebarRow(titled: customTitle, in: relaunched).waitForExistence(timeout: 10),
-                  "user-titled empty chat must survive the launch reconcile; app tree: \(relaunched.debugDescription)")
+                  "user title must survive relaunch; app tree: \(relaunched.debugDescription)")
   }
 
-  /// Probe for the prune-vs-scaffold-teardown ordering from ticket #534: an
-  /// empty draft can have the no-model sheet raised (blocked send, no user
-  /// message persisted) when the user leaves it. The selection-change prune
-  /// deletes the outgoing chat while `ChatScaffoldView` teardown/onChange
-  /// closures may still be unwinding; this must not trap, and the empty draft
-  /// must still be pruned. If the macOS sheet consumes the first sidebar
-  /// click, dismiss it and complete the switch so the test does not confuse a
-  /// modal event-routing limitation with a lifecycle crash.
+  /// A send blocked by the no-model gate remains a transient draft. Switching
+  /// to an existing conversation drops it without a persistence delete.
   @MainActor
   func test_switching_from_empty_chat_with_noModelPrompt_visible_does_not_crash() async throws {
     let anchorPrompt = "Anchor chat for no model prune probe"
@@ -237,12 +237,9 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     // launch prompt too so the later visible prompt belongs to the empty
     // draft created below.
     dismissNoModelGateIfPresent(in: app)
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 5),
-                  "New Chat button missing before prompt-prune probe; app tree: \(app.debugDescription)")
-    newChat.click()
-    XCTAssertTrue(waitForNewChatRowCount(1, in: app),
-                  "empty draft row missing before blocked send; app tree: \(app.debugDescription)")
+    openFreshChat(in: app)
+    XCTAssertTrue(waitForNewChatRowCount(0, in: app),
+                  "empty draft must not create a row before blocked send; app tree: \(app.debugDescription)")
 
     typeComposerText(blockedDraft, in: app)
     let send = app.buttons["composer.send"]
@@ -267,7 +264,7 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     XCTAssertTrue(sidebarRow(titled: anchorPrompt, in: app).waitForExistence(timeout: 5),
                   "anchor chat missing after leaving empty prompted draft; app tree: \(app.debugDescription)")
     XCTAssertTrue(waitForNewChatRowCount(0, in: app),
-                  "leaving the empty prompted draft must prune it; app tree: \(app.debugDescription)")
+                  "leaving the prompted draft must not leave a row; app tree: \(app.debugDescription)")
     XCTAssertFalse(app.staticTexts[blockedDraft].exists,
                    "blocked draft text must not have been committed as a user message")
   }
@@ -311,24 +308,20 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
 
     // Switching away must NOT prune it (user-authored turn + title).
     dismissNoModelGateIfPresent(in: app)
-    let newChat = app.buttons["chats.newButton"]
-    XCTAssertTrue(newChat.waitForExistence(timeout: 5))
-    newChat.click()
+    openFreshChat(in: app)
     XCTAssertTrue(sidebarRow(titled: prompt, in: app).waitForExistence(timeout: 5),
                   "a chat with a committed (failed) send must survive switch-away; app tree: \(app.debugDescription)")
-    XCTAssertTrue(waitForNewChatRowCount(1, in: app),
-                  "the fresh draft row must appear after New Chat; app tree: \(app.debugDescription)")
+    XCTAssertTrue(waitForNewChatRowCount(0, in: app),
+                  "a fresh draft must not appear in the sidebar; app tree: \(app.debugDescription)")
 
-    // Switching BACK to the real chat leaves the untouched draft — it must
-    // be pruned the moment the user leaves it (the switch-away prune).
+    // Switching BACK to the real chat simply abandons the in-memory draft.
     sidebarRow(titled: prompt, in: app).click()
     XCTAssertTrue(waitForNewChatRowCount(0, in: app),
-                  "leaving an empty draft must prune it; app tree: \(app.debugDescription)")
+                  "leaving a draft must not create or retain a row; app tree: \(app.debugDescription)")
     XCTAssertTrue(sidebarRow(titled: prompt, in: app).exists,
                   "the real chat must survive the draft prune; app tree: \(app.debugDescription)")
 
-    // Relaunch: the abandoned empty draft is reconciled away, the real
-    // (failed-send) chat persists under its derived title.
+    // Relaunch: the real failed-send chat persists under its derived title.
     app.terminate()
     let relaunched = makeApp(pieHome: home)
     relaunched.launch()
@@ -339,6 +332,6 @@ final class S512_ChatLifecycleGUITests: XCTestCase {
     XCTAssertTrue(sidebarRow(titled: prompt, in: relaunched).waitForExistence(timeout: 10),
                   "titled chat missing after relaunch; app tree: \(relaunched.debugDescription)")
     XCTAssertTrue(waitForNewChatRowCount(0, in: relaunched),
-                  "the empty draft left at quit must be reconciled away; app tree: \(relaunched.debugDescription)")
+                  "no transient draft row may appear after relaunch; app tree: \(relaunched.debugDescription)")
   }
 }
