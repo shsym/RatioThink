@@ -66,7 +66,7 @@ assert_grep 'run: make verify-inferlets' .github/workflows/lint.yml "cheap infer
 # building the Rust engine long pole. Exercise the build-phase entrypoint in
 # skip mode with no cargo dependency.
 static_out="$(mktemp)"
-if PIE_SKIP_ENGINE_BUILD=1 ARCHS=arm64 SRCROOT="$ROOT" BUILT_PRODUCTS_DIR="$(mktemp -d)" UNLOCALIZED_RESOURCES_FOLDER_PATH=RatioThink.app/Contents/Resources ./Scripts/build-pie-engine.sh >"$static_out" 2>&1; then
+if PIE_SKIP_ENGINE_BUILD=1 CONFIGURATION=Debug ARCHS=arm64 SRCROOT="$ROOT" BUILT_PRODUCTS_DIR="$(mktemp -d)" UNLOCALIZED_RESOURCES_FOLDER_PATH=RatioThink.app/Contents/Resources ./Scripts/build-pie-engine.sh >"$static_out" 2>&1; then
   if grep -q 'PIE_SKIP_ENGINE_BUILD=1' "$static_out"; then
     ok "build-pie-engine supports explicit static-build skip mode"
   else
@@ -77,6 +77,25 @@ else
   not_ok "build-pie-engine skip mode should exit 0 without invoking cargo"
 fi
 rm -f "$static_out"
+
+# A static-skip environment must never suppress the engine in Release. Omit
+# ARCHS so continuing into the real build path stops at the existing preflight,
+# before rustup or cargo can run; exiting 0 here would prove Release was skipped.
+release_out="$(mktemp)"
+set +e
+PIE_SKIP_ENGINE_BUILD=1 CONFIGURATION=Release SRCROOT="$ROOT" \
+  ./Scripts/build-pie-engine.sh >"$release_out" 2>&1
+release_rc=$?
+set -e
+if [[ "$release_rc" -eq 0 ]] || grep -Eq 'skipping (cargo pie )?engine build' "$release_out"; then
+  not_ok "build-pie-engine must not honor static-build skip mode in Release"
+elif grep -q 'no --arch and no \$ARCHS set' "$release_out"; then
+  ok "build-pie-engine ignores static-build skip mode in Release"
+else
+  cat "$release_out" >&2
+  not_ok "build-pie-engine Release probe did not reach the engine-build preflight"
+fi
+rm -f "$release_out"
 
 if [[ "$fail" -ne 0 ]]; then
   echo "ci-v2-static-gate: $pass passed, $fail failed" >&2
