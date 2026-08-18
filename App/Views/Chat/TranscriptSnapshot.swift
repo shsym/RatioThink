@@ -48,10 +48,20 @@ struct TranscriptSnapshot: Equatable {
 
   init(items: [ChatMessageItem]) {
     self.items = items
-    let lengthSum = items.reduce(0) { partial, item in
-      partial &+ item.content.count &+ item.reasoning.count
+    let revision = items.reduce(into: (
+      textLength: 0, treeNodeCount: 0, treeTextLength: 0, candidateCount: 0
+    )) { partial, item in
+      partial.textLength &+= item.content.count &+ item.reasoning.count
+      if let tree = item.tot {
+        partial.treeNodeCount &+= tree.nodes.count
+        for node in tree.nodes {
+          partial.treeTextLength &+= node.content.count &+ node.reasoning.count
+        }
+      }
+      partial.candidateCount &+= item.bestOfN?.candidates.count ?? 0
     }
-    self.scrollKey = "\(items.count):\(lengthSum)"
+    self.scrollKey = "\(items.count):\(revision.textLength):\(revision.treeNodeCount):"
+      + "\(revision.treeTextLength):\(revision.candidateCount)"
   }
 
   init<MessageSource: Sequence>(

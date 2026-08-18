@@ -51,7 +51,7 @@ final class TranscriptSnapshotTests: XCTestCase {
 
     XCTAssertEqual(snapshot.items.map(\.id), [firstID, secondID, thirdID])
     XCTAssertEqual(snapshot.items.map(\.content), ["head", "middle", "tail"])
-    XCTAssertEqual(snapshot.scrollKey, "3:14")
+    XCTAssertEqual(snapshot.scrollKey, "3:14:0:0:0")
   }
 
   func test_snapshot_scroll_key_changes_when_reasoning_only_stream_grows() {
@@ -63,9 +63,97 @@ final class TranscriptSnapshotTests: XCTestCase {
       ChatMessageItem(id: id, role: .assistant, content: "", reasoning: "thinking…")
     ])
 
-    XCTAssertEqual(first.scrollKey, "1:5")
-    XCTAssertEqual(updated.scrollKey, "1:9")
+    XCTAssertEqual(first.scrollKey, "1:5:0:0:0")
+    XCTAssertEqual(updated.scrollKey, "1:9:0:0:0")
     XCTAssertNotEqual(first.scrollKey, updated.scrollKey)
+  }
+
+  func test_snapshot_scroll_key_changes_when_tot_adds_node() {
+    let id = UUID()
+    var tree = ToTTree()
+    let first = TranscriptSnapshot(items: [
+      ChatMessageItem(id: id, role: .assistant, content: "", tot: tree)
+    ])
+
+    tree.apply(.nodeStart(id: "tot-n1", parentID: "root", depth: 1, branchIndex: 0))
+    let updated = TranscriptSnapshot(items: [
+      ChatMessageItem(id: id, role: .assistant, content: "", tot: tree)
+    ])
+
+    XCTAssertNotEqual(first.scrollKey, updated.scrollKey)
+  }
+
+  func test_snapshot_scroll_key_changes_when_tot_node_text_grows() {
+    let id = UUID()
+    var tree = ToTTree()
+    tree.apply(.nodeStart(id: "tot-n1", parentID: "root", depth: 1, branchIndex: 0))
+    let first = TranscriptSnapshot(items: [
+      ChatMessageItem(id: id, role: .assistant, content: "", tot: tree)
+    ])
+
+    tree.apply(.nodeDelta(id: "tot-n1", channel: .answer, text: "A longer branch"))
+    let updated = TranscriptSnapshot(items: [
+      ChatMessageItem(id: id, role: .assistant, content: "", tot: tree)
+    ])
+
+    XCTAssertNotEqual(first.scrollKey, updated.scrollKey)
+  }
+
+  func test_snapshot_scroll_key_changes_when_best_of_n_refinement_adds_candidate() {
+    let id = UUID()
+    let firstCandidate = ToTSelectionCandidate(
+      id: "bon-n0", branchIndex: 0, snapshotName: "bon/round/1/0/s0")
+    var tree = ToTTree()
+    tree.apply(.nodeStart(id: firstCandidate.id, parentID: "root", depth: 1, branchIndex: 0))
+    let first = TranscriptSnapshot(items: [
+      ChatMessageItem(
+        id: id,
+        role: .assistant,
+        content: "",
+        tot: tree,
+        bestOfN: BestOfNRound(level: 1, candidates: [firstCandidate]))
+    ])
+
+    let refinedCandidate = ToTSelectionCandidate(
+      id: "bon-n1", branchIndex: 0, snapshotName: "bon/round/2/0/s1")
+    tree.apply(.nodeStart(
+      id: refinedCandidate.id, parentID: firstCandidate.id, depth: 2, branchIndex: 0))
+    let refined = TranscriptSnapshot(items: [
+      ChatMessageItem(
+        id: id,
+        role: .assistant,
+        content: "",
+        tot: tree,
+        bestOfN: BestOfNRound(level: 2, candidates: [refinedCandidate]))
+    ])
+
+    XCTAssertNotEqual(first.scrollKey, refined.scrollKey)
+  }
+
+  func test_snapshot_scroll_key_changes_when_best_of_n_round_becomes_pickable() {
+    let id = UUID()
+    let tree = ToTTree()
+    let generating = TranscriptSnapshot(items: [
+      ChatMessageItem(
+        id: id,
+        role: .assistant,
+        content: "",
+        tot: tree,
+        bestOfN: BestOfNRound(level: 0, candidates: []))
+    ])
+
+    let candidate = ToTSelectionCandidate(
+      id: "bon-n0", branchIndex: 0, snapshotName: "bon/round/1/0/s0")
+    let pickable = TranscriptSnapshot(items: [
+      ChatMessageItem(
+        id: id,
+        role: .assistant,
+        content: "",
+        tot: tree,
+        bestOfN: BestOfNRound(level: 1, candidates: [candidate]))
+    ])
+
+    XCTAssertNotEqual(generating.scrollKey, pickable.scrollKey)
   }
 
   func test_snapshot_traverses_source_and_projects_each_message_once() {
