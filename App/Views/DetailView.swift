@@ -13,17 +13,22 @@ struct DetailView: View {
 
   var body: some View {
     switch (section, selectedItemID) {
-    case (.chats, let id?):
+    case (.chats, _) where selectedItemID != nil || windowState.pendingChatDraft != nil:
       // `.id(id)` rebuilds the scaffold (and its `@StateObject`
       // view-model) when switching between chat rows so each chat has
       // its own toolbar state. The scaffold itself loads the chat
       // row via `@Query` keyed on `id`.
-      ChatScaffoldView(chatID: id)
-        .id(id)
-    case (.chats, nil) where windowState.pendingChatDraft != nil:
-      if let draft = windowState.pendingChatDraft {
-        ChatScaffoldView(draftChat: draft)
-          .id(draft.id)
+      //
+      // Draft and saved chats share this ONE structural branch on purpose:
+      // a draft's first save flips the route from `pendingChatDraft` to
+      // `selectedItemID` under the SAME chat UUID, and only an unchanged
+      // branch + unchanged `.id` lets SwiftUI keep the scaffold instance —
+      // so toolbar overrides set on the draft survive the commit instead of
+      // resetting with a remounted view-model.
+      let draft = selectedItemID == nil ? windowState.pendingChatDraft : nil
+      if let id = selectedItemID ?? draft?.id {
+        ChatScaffoldView(chatID: id, draftChat: draft)
+          .id(id)
       }
     case (.search, _):
       // Sibling destination: a search panel over conversation titles +

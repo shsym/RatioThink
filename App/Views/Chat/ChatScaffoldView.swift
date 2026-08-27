@@ -42,7 +42,10 @@ struct AttachmentModelContextLengthCache: Equatable {
 struct ChatScaffoldView: View {
   @Query private var chats: [Chat]
   /// Non-nil only while a new conversation is still outside SwiftData.
-  /// `DetailView` remounts the query-backed form after its first message saves.
+  /// After the first message saves, `DetailView` re-renders this SAME
+  /// scaffold instance (single branch, same `.id`) with `draftChat` nil and
+  /// the `@Query` row taking over — the view-model (toolbar overrides
+  /// included) survives the transition.
   private let draftChat: Chat?
   @Environment(\.modelContext) private var modelContext
   @StateObject private var viewModel: ChatTranscriptViewModel
@@ -212,26 +215,13 @@ struct ChatScaffoldView: View {
 
   init(
     chatID: UUID,
+    draftChat: Chat? = nil,
     availableProfiles: [String] = ["chat"],
     availableModels: [String] = ChatTranscriptViewModel.placeholderModels
   ) {
     // Capture the id into a local so the predicate closure does not
     // retain `self` (which doesn't exist yet during `init`).
     let id = chatID
-    _chats = Query(filter: #Predicate<Chat> { $0.id == id })
-    _viewModel = StateObject(wrappedValue: ChatTranscriptViewModel())
-    self.chatID = id
-    self.draftChat = nil
-    self.availableProfiles = availableProfiles
-    self.availableModels = availableModels
-  }
-
-  init(
-    draftChat: Chat,
-    availableProfiles: [String] = ["chat"],
-    availableModels: [String] = ChatTranscriptViewModel.placeholderModels
-  ) {
-    let id = draftChat.id
     _chats = Query(filter: #Predicate<Chat> { $0.id == id })
     _viewModel = StateObject(wrappedValue: ChatTranscriptViewModel())
     self.chatID = id
@@ -644,18 +634,18 @@ struct ChatScaffoldView: View {
           onSendBlocked: { draft in
             handleBlockedSend(draft: draft, for: chat)
           },
-          onUserMessageSaved: { message in
+          onUserMessageSaved: { _ in
             // A send committed (manual or fired auto-send) — any armed
             // pending send is now satisfied or superseded. #516.
             pendingSend.disarm()
             cancelDeferredEngineSync()
-            // For a transient composer the saved message owns the new persisted
-            // chat copy. Send against that object, then replace the draft route
-            // with the normal query-backed selection.
-            let savedChat = message.chat ?? chat
-            sendAssistantTurn(for: savedChat)
+            // For a transient composer the draft object itself was just
+            // inserted and saved. Send against it, then replace the draft
+            // route with the normal query-backed selection (same UUID, so
+            // the scaffold instance — and its overrides — survive).
+            sendAssistantTurn(for: chat)
             if draftChat != nil {
-              windowState.commitChatDraft(savedChat.id)
+              windowState.commitChatDraft(chat.id)
             }
           },
           // #507: the composer's stop button — the user-reachable cancel
